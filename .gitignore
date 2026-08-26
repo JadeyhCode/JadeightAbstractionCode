@@ -1,0 +1,8 @@
+# 构建产物
+cmake-build-debug/
+build/
+jasm
+jasm_dbg
+*.bc
+*.o
+.idea/
