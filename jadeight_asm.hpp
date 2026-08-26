@@ -103,6 +103,10 @@ enum : uint8_t {
     OP_MEMCPY,
     // 获取系统信息 (175)：压入 u64（低 16 位=平台，次 16 位=架构）
     OP_GET_SYSTEM,
+    // 运行时动态注册 C 函数 (176)：DL_REG(fnPtrOff:u32, sigPtrOff:u32) → 压入 u32 索引
+    OP_DL_REG,
+    // 按运行时索引调用 C 函数 (177)：DL_CALL(idxOff:u32, argBaseOff:u32, retOff:u32)
+    OP_DL_CALL,
 };
 
 // ==================== 名称 -> opcode 映射 ====================
@@ -134,6 +138,8 @@ static const std::map<std::string, uint8_t> opNameMap = {
     {"JIT_SUBMIT", OP_JIT_SUBMIT},
     {"MEMCPY", OP_MEMCPY},
     {"GET_SYSTEM", OP_GET_SYSTEM},
+    {"DL_REG", OP_DL_REG},
+    {"DL_CALL", OP_DL_CALL},
 };
 
 // 生成所有类型化指令的名称映射
@@ -218,6 +224,8 @@ inline size_t instrLen(uint8_t op) {
     case OP_JIT_SUBMIT: return 9;
     case OP_MEMCPY: return 27;
     case OP_GET_SYSTEM: return 1;
+    case OP_DL_REG: return 9;
+    case OP_DL_CALL: return 13;
     default: return 1;
     }
 }
@@ -415,6 +423,12 @@ public:
                 break;
             case OP_EXTERN_CALL:
                 os << " idx=" << (int)p[1] << ", argOff=" << rdBE<uint32_t>(p+2) << ", retOff=" << rdBE<uint32_t>(p+6);
+                break;
+            case OP_DL_REG:
+                os << " fnPtrOff=" << rdBE<uint32_t>(p+1) << ", sigPtrOff=" << rdBE<uint32_t>(p+5);
+                break;
+            case OP_DL_CALL:
+                os << " idxOff=" << rdBE<uint32_t>(p+1) << ", argOff=" << rdBE<uint32_t>(p+5) << ", retOff=" << rdBE<uint32_t>(p+9);
                 break;
             case OP_FUNC_CALL:
                 os << " fnOff=" << rdBE<uint32_t>(p+1) << ", argOff=" << rdBE<uint32_t>(p+5) << ", retOff=" << rdBE<uint32_t>(p+9);
@@ -738,6 +752,28 @@ private:
             inst.operands = {idx, argOff, retOff};
             return true;
         }
+        case OP_DL_REG: {
+            if (!expectCount(2)) return false;
+            bool ok;
+            uint64_t fnPtrOff = parseNum(tokens[0], ok);
+            if (!ok) { error("Bad fnPtrOff: " + tokens[0]); return false; }
+            uint64_t sigPtrOff = parseNum(tokens[1], ok);
+            if (!ok) { error("Bad sigPtrOff: " + tokens[1]); return false; }
+            inst.operands = {fnPtrOff, sigPtrOff};
+            return true;
+        }
+        case OP_DL_CALL: {
+            if (!expectCount(3)) return false;
+            bool ok;
+            uint64_t idxOff = parseNum(tokens[0], ok);
+            if (!ok) { error("Bad idxOff: " + tokens[0]); return false; }
+            uint64_t argOff = parseNum(tokens[1], ok);
+            if (!ok) { error("Bad argOff: " + tokens[1]); return false; }
+            uint64_t retOff = parseNum(tokens[2], ok);
+            if (!ok) { error("Bad retOff: " + tokens[2]); return false; }
+            inst.operands = {idxOff, argOff, retOff};
+            return true;
+        }
         case OP_JIT_SUBMIT: {
             if (!expectCount(2)) return false;
             bool ok;
@@ -1048,6 +1084,20 @@ private:
                     wrBE<uint32_t>(&outBytes[outBytes.size()-4], argOff);
                     outBytes.resize(outBytes.size()+4);
                     wrBE<uint32_t>(&outBytes[outBytes.size()-4], retOff);
+                    break;
+                }
+                case OP_DL_REG: {
+                    for (int k = 0; k < 2; ++k) {
+                        outBytes.resize(outBytes.size()+4);
+                        wrBE<uint32_t>(&outBytes[outBytes.size()-4], static_cast<uint32_t>(inst.operands[k]));
+                    }
+                    break;
+                }
+                case OP_DL_CALL: {
+                    for (int k = 0; k < 3; ++k) {
+                        outBytes.resize(outBytes.size()+4);
+                        wrBE<uint32_t>(&outBytes[outBytes.size()-4], static_cast<uint32_t>(inst.operands[k]));
+                    }
                     break;
                 }
                 case OP_FUNC_CALL: {
