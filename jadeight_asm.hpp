@@ -101,6 +101,8 @@ enum : uint8_t {
     OP_JIT_SUBMIT,
     // 内存拷贝 (174)
     OP_MEMCPY,
+    // 获取系统信息 (175)：压入 u64（低 16 位=平台，次 16 位=架构）
+    OP_GET_SYSTEM,
 };
 
 // ==================== 名称 -> opcode 映射 ====================
@@ -131,6 +133,7 @@ static const std::map<std::string, uint8_t> opNameMap = {
     {"FUNC_CALL", OP_FUNC_CALL},
     {"JIT_SUBMIT", OP_JIT_SUBMIT},
     {"MEMCPY", OP_MEMCPY},
+    {"GET_SYSTEM", OP_GET_SYSTEM},
 };
 
 // 生成所有类型化指令的名称映射
@@ -214,6 +217,7 @@ inline size_t instrLen(uint8_t op) {
     case OP_FUNC_CALL: return 13;
     case OP_JIT_SUBMIT: return 9;
     case OP_MEMCPY: return 27;
+    case OP_GET_SYSTEM: return 1;
     default: return 1;
     }
 }
