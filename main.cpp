@@ -7,7 +7,7 @@
 //   -e  头部按【小端序】读写（与 Jadeight2 VM FunctionSave::loadFromFile 兼容；
 //       默认大端序，与自身反汇编回环一致）
 //
-// 汇编器支持全部 174 条 opcode，标签，多种数值格式，
+// 汇编器支持全部 177 条 opcode，标签，多种数值格式，
 // 伪指令 .STACK .ARGS .RETS .ENTRY .ENTRYOFF .BYTE .FILL
 //
 // 编译: g++ -std=c++20 -O2 jasm.cpp -o jasm
