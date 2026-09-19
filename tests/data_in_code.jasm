@@ -1,0 +1,54 @@
+; data_in_code.jasm —— 反汇编回环回归夹具
+;
+; 关键场景：码流里夹着**数据**（j8c 把字符串常量以 .BYTE 直接写进函数体，
+; 见 JadeightCompiler 的 codegen）。线性扫描会把数据字节当指令解码，例如
+; 0x61 是 OP_SQRT、其后的 0x6C 不是合法 TypeDesc。修复前 jasm -d 会输出
+; "SQRT ?"，而 "?" 无法被自己再汇编 → 回环断裂。
+;
+; 现在的约定：凡是解出来后无法精确还原的行，一律退化成按字节的 .BYTE，
+; 因此这份夹具必须满足「汇编 → -d → 再汇编」逐字节一致。
+.ENTRY main
+
+.FUNC main 0 0
+  STACK_INIT 4096 64
+  MOVI u64 R0, 12345
+  PUSH_REG u64 R0
+  POP_REG u64 R0
+  CMP EQ u64
+  BRANCH Lskip
+  JMP Lend
+Lskip:
+  ; ↓ 字符串 "false\0" —— 纯数据，不是指令
+  .BYTE 102
+  .BYTE 97
+  .BYTE 108
+  .BYTE 115
+  .BYTE 101
+  .BYTE 0
+  ADD u8
+  SUB i8
+  MUL f64
+  DIV i32
+  REM u16
+  NEG f32
+  SHL u8
+  SHR i16
+  AND u32
+  OR u64
+  XOR u8
+  NOT u8
+  SQRT f64
+  LOG f64
+  CVT u32, f64
+  COUT u8
+  STORE u32 R1, 0, 8
+  LOAD u32 R0, 0, 8
+  LEA 0, 16
+  NEW_ARRAY 64, 24
+  FREE_ARRAY 24
+  MEMCPY 0, 32, 0, 40, 8
+  FUNC_ADDR 0
+  JIT_SUBMIT 0, 48
+  HALT
+Lend:
+  RET

@@ -1,1152 +1,756 @@
-// jadeight_asm.hpp — Jadeight VM 汇编器（header-only 库）
+// ============================================================================
+// Jadeight / jadeight_asm.hpp —— ISA v3 汇编器 + 反汇编器（header-only 库）
+// ============================================================================
+// 与 v2 汇编器的差别（v3 是合并式指令集，ISA 定义见 Jadeight2ReWrite/isa.hpp）：
+//   - 类型不再是 opcode 的一部分，而是操作数：`ADD u8`、`MOVI u64 R0, 123`
+//   - 操作数一律小端（v2 是「12 字节头 LE + 指令流操作数 BE」的混搭）
+//   - 跳转只有标签跳转：`JMP L1` / `BRANCH L1`，标签是**函数相对**偏移
+//   - 多函数：`.FUNC <名> [参数字节] [返回字节]` 划分函数，产出函数目录
+//   - 输出 = v3 模块文件（magic "J3BC"），不再是「12 字节头 + 单函数码流」
 //
-// 从 jasm main.cpp 抽取：Assembler 类 + 全部 opcode 定义/名称表/指令长度表。
-// 供两类使用者复用：
-//   1) jasm 命令行工具（main.cpp 里的薄 CLI）
-//   2) JadeightCompiler —— 在汇编器之上封装 C 风格编译器（"封装一层"）
-//
-// 用法:
-//   #include "jadeight_asm.hpp"
-//   jadeight::Assembler asmblr;
-//   asmblr.verbose = ...; asmblr.pureBinary = ...; asmblr.littleEndianHeader = ...;
-//   std::vector<uint8_t> bytes; uint32_t argSize, retSize, entry;
-//   asmblr.assemble(asmText, bytes, argSize, retSize, entry);
-//
-// 注意: 默认 .bc 头部为【大端序】(argSize,retSize,entry 各 u32 BE)，与汇编器自身
-//       反汇编回环一致；设 littleEndianHeader=true 时头部改为【小端序】，与
-//       Jadeight2 虚拟机 FunctionSave::loadFromFile 的文件格式一致。
-
+// 兼容旧调用方式：`pureBinary = true` 时 `assemble()` 只输出纯码流（j8c 用），
+// 函数目录通过 `funcs` 取。
+// ============================================================================
 #pragma once
 
-#include <algorithm>
-#include <cassert>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <cctype>
 #include <fstream>
 #include <iostream>
 #include <map>
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#include "isa.hpp"
 
 namespace jadeight {
 
-// ==================== opcode 定义 (与 Jadeight2 VM 完全一致) ====================
-enum : uint8_t {
-    OP_ERR_END = 0,
-    // REG 寄存器指令族 (1..21)
-    OP_REG_MOVI_U8, OP_REG_MOVI_U16, OP_REG_MOVI_U32, OP_REG_MOVI_U64,
-    OP_REG_MOV,
-    OP_REG_PUSH_U8, OP_REG_PUSH_U16, OP_REG_PUSH_U32, OP_REG_PUSH_U64,
-    OP_REG_POP_U8, OP_REG_POP_U16, OP_REG_POP_U32, OP_REG_POP_U64,
-    OP_REG_LOAD_U8, OP_REG_LOAD_U16, OP_REG_LOAD_U32, OP_REG_LOAD_U64,
-    OP_REG_STORE_U8, OP_REG_STORE_U16, OP_REG_STORE_U32, OP_REG_STORE_U64,
-    // 基础指令 (22..34)
-    OP_END, OP_STACK_INIT, OP_JMP, OP_SHORT_JMP,
-    OP_SCOPE_PUSH, OP_SCOPE_POP, OP_STACK_PTR_MOVE, OP_NEW_STACK,
-    OP_NEW_HEAP, OP_DEL_HEAP, OP_IF_GOTO,
-    OP_LEA,
-    OP_MOVI_U32,
-    // 四则运算 (35..68)
-    OP_ADD_U8, OP_ADD_U16, OP_ADD_U32, OP_ADD_U64, OP_ADD_F32, OP_ADD_F64,
-    OP_SUB_U8, OP_SUB_U16, OP_SUB_U32, OP_SUB_U64, OP_SUB_F32, OP_SUB_F64,
-    OP_MUL_U8, OP_MUL_I8, OP_MUL_U16, OP_MUL_I16, OP_MUL_U32, OP_MUL_I32,
-    OP_MUL_U64, OP_MUL_I64, OP_MUL_F32, OP_MUL_F64,
-    OP_DIV_U8, OP_DIV_I8, OP_DIV_U16, OP_DIV_I16, OP_DIV_U32, OP_DIV_I32,
-    OP_DIV_U64, OP_DIV_I64, OP_DIV_F32, OP_DIV_F64,
-    OP_ADD_PTR, OP_SUB_PTR,
-    // SQRT / LOG (69..88)
-    OP_SQRT_U8, OP_SQRT_I8, OP_SQRT_U16, OP_SQRT_I16, OP_SQRT_U32, OP_SQRT_I32,
-    OP_SQRT_U64, OP_SQRT_I64, OP_SQRT_F32, OP_SQRT_F64,
-    OP_LOG_U8, OP_LOG_I8, OP_LOG_U16, OP_LOG_I16, OP_LOG_U32, OP_LOG_I32,
-    OP_LOG_U64, OP_LOG_I64, OP_LOG_F32, OP_LOG_F64,
-    // COUT (89..91)
-    OP_COUT_CHAR8, OP_COUT_CHAR16, OP_COUT_CHAR32,
-    // 比较 (92..124)
-    OP_CMP_LT_U8, OP_CMP_LT_I8, OP_CMP_LT_U16, OP_CMP_LT_I16, OP_CMP_LT_U32, OP_CMP_LT_I32,
-    OP_CMP_LT_U64, OP_CMP_LT_I64, OP_CMP_LT_F32, OP_CMP_LT_F64, OP_CMP_LT_PTR,
-    OP_CMP_EQ_U8, OP_CMP_EQ_I8, OP_CMP_EQ_U16, OP_CMP_EQ_I16, OP_CMP_EQ_U32, OP_CMP_EQ_I32,
-    OP_CMP_EQ_U64, OP_CMP_EQ_I64, OP_CMP_EQ_F32, OP_CMP_EQ_F64, OP_CMP_EQ_PTR,
-    OP_CMP_GT_U8, OP_CMP_GT_I8, OP_CMP_GT_U16, OP_CMP_GT_I16, OP_CMP_GT_U32, OP_CMP_GT_I32,
-    OP_CMP_GT_U64, OP_CMP_GT_I64, OP_CMP_GT_F32, OP_CMP_GT_F64, OP_CMP_GT_PTR,
-    // 位运算 (125..148)
-    OP_SHL_U8, OP_SHL_U16, OP_SHL_U32, OP_SHL_U64,
-    OP_AND_U8, OP_AND_U16, OP_AND_U32, OP_AND_U64,
-    OP_OR_U8, OP_OR_U16, OP_OR_U32, OP_OR_U64,
-    OP_NOT_U8, OP_NOT_U16, OP_NOT_U32, OP_NOT_U64,
-    OP_SHR_U8, OP_SHR_U16, OP_SHR_U32, OP_SHR_U64,
-    OP_SHR_I8, OP_SHR_I16, OP_SHR_I32, OP_SHR_I64,
-    // 类型转换 (149..156)
-    OP_CVT_F32_U32, OP_CVT_F32_I32, OP_CVT_F64_U32, OP_CVT_F64_I32,
-    OP_CVT_U32_F32, OP_CVT_U32_F64, OP_CVT_I32_F32, OP_CVT_I32_F64,
-    // 分配器 (157..158)
-    OP_NEW_ARRAY, OP_FREE_ARRAY,
-    // 系统地址 / 间接跳转 (159..160)
-    OP_GET_ADDRS, OP_JMP_IND,
-    // 原子变量 (161..170)
-    OP_ATOMIC_LOAD_U32, OP_ATOMIC_LOAD_U64,
-    OP_ATOMIC_STORE_U32, OP_ATOMIC_STORE_U64,
-    OP_ATOMIC_XCHG_U32, OP_ATOMIC_XCHG_U64,
-    OP_ATOMIC_CAS_U32, OP_ATOMIC_CAS_U64,
-    OP_ATOMIC_ADD_U32, OP_ATOMIC_ADD_U64,
-    // 外部调用 (171)
-    OP_EXTERN_CALL,
-    // VM 函数调用 (172)
-    OP_FUNC_CALL,
-    // JIT 提交 (173)
-    OP_JIT_SUBMIT,
-    // 内存拷贝 (174)
-    OP_MEMCPY,
-    // 获取系统信息 (175)：压入 u64（低 16 位=平台，次 16 位=架构）
-    OP_GET_SYSTEM,
-    // 运行时动态注册 C 函数 (176)：DL_REG(fnPtrOff:u32, sigPtrOff:u32) → 压入 u32 索引
-    OP_DL_REG,
-    // 按运行时索引调用 C 函数 (177)：DL_CALL(idxOff:u32, argBaseOff:u32, retOff:u32)
-    OP_DL_CALL,
+[[gnu::always_inline]] inline uint64_t asmLoadRaw(const uint8_t* p, uint8_t w) {
+    uint64_t r = 0;
+    for (uint8_t i = 0; i < w; ++i) r |= static_cast<uint64_t>(p[i]) << (8 * i);
+    return r;
+}
+
+// ============================================================================
+// 助记名 / 操作数解析
+// ============================================================================
+// 助记名表只有一份：isa.hpp 的 opName（这里原本抄了一份，改指令集时两边容易漂）
+inline bool mnemonicToOp(const std::string& s, uint8_t& op) {
+    if (s.empty()) return false;
+    static const uint8_t known[] = {
+        OP_TRAP, OP_NOP, OP_HALT, OP_JMP, OP_BRANCH, OP_CALL, OP_CALL_IND, OP_RET, OP_JMP_IND,
+        OP_STACK_INIT, OP_SCOPE_PUSH, OP_SCOPE_POP, OP_STACK_MOVE, OP_STACK_ALLOC,
+        OP_LOAD, OP_STORE, OP_LEA, OP_NEW_HEAP, OP_DEL_HEAP, OP_NEW_ARRAY, OP_FREE_ARRAY,
+        OP_MEMCPY, OP_GET_ADDRS, OP_MOVI, OP_MOV, OP_PUSH_REG, OP_POP_REG, OP_PUSH_IMM,
+        OP_ADD, OP_SUB, OP_MUL, OP_DIV, OP_REM, OP_NEG, OP_SHL, OP_SHR, OP_AND, OP_OR,
+        OP_XOR, OP_NOT, OP_CMP, OP_SQRT, OP_LOG, OP_CVT, OP_COUT, OP_GET_SYSTEM,
+        OP_EXTERN_CALL, OP_DL_REG, OP_DL_CALL, OP_JIT_SUBMIT,
+        OP_ATOMIC_LOAD, OP_ATOMIC_STORE, OP_ATOMIC_XCHG, OP_ATOMIC_CAS, OP_ATOMIC_ADD,
+        OP_FUNC_ADDR, OP_THREAD_SPAWN, OP_THREAD_JOIN, OP_THREAD_EXIT, OP_THREAD_SELF,
+        OP_THREAD_YIELD, OP_PROC_SPAWN, OP_PROC_WAIT, OP_PROC_EXIT, OP_PROC_SELF, OP_PROC_SHARE,
+        OP_JIT_COMPILE, OP_CALL_NATIVE,
+    };
+    for (uint8_t k : known)
+        if (s == opName(k)) { op = k; return true; }
+    return false;
+}
+
+inline bool tdFromName(const std::string& s, uint8_t& td) {
+    if (s == "u8") td = TD_U8;         else if (s == "u16") td = TD_U16;
+    else if (s == "u32") td = TD_U32;  else if (s == "u64") td = TD_U64;
+    else if (s == "i8") td = TD_I8;    else if (s == "i16") td = TD_I16;
+    else if (s == "i32") td = TD_I32;  else if (s == "i64") td = TD_I64;
+    else if (s == "f32") td = TD_F32;  else if (s == "f64") td = TD_F64;
+    else if (s == "ptr") td = TD_PTR;
+    else return false;
+    return true;
+}
+
+inline bool cmpFromName(const std::string& s, uint8_t& sub) {
+    if (s == "LT") sub = CMP_LT;      else if (s == "LE") sub = CMP_LE;
+    else if (s == "EQ") sub = CMP_EQ; else if (s == "NE") sub = CMP_NE;
+    else if (s == "GT") sub = CMP_GT; else if (s == "GE") sub = CMP_GE;
+    else return false;
+    return true;
+}
+
+inline bool parseU64(const std::string& s, uint64_t& v) {
+    if (s.empty()) return false;
+    char* end = nullptr;
+    if (s.size() > 2 && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+        v = std::strtoull(s.c_str() + 2, &end, 16);
+        return end && *end == 0;
+    }
+    if (s[0] == '-' || s[0] == '+') { // 负数按二进制补码
+        const long long x = std::strtoll(s.c_str(), &end, 0);
+        if (end && *end == 0) { v = static_cast<uint64_t>(x); return true; }
+        return false;
+    }
+    if (s.size() >= 3 && s.front() == '\'' && s.back() == '\'') { // 字符字面量
+        v = static_cast<uint64_t>(static_cast<unsigned char>(s[1]));
+        return true;
+    }
+    v = std::strtoull(s.c_str(), &end, 10);
+    return end && *end == 0;
+}
+
+inline bool parseReg(const std::string& s, uint8_t& r) {
+    std::string t = s;
+    if (!t.empty() && (t[0] == 'R' || t[0] == 'r')) t = t.substr(1);
+    uint64_t v = 0;
+    if (!parseU64(t, v) || v > 15) return false;
+    r = static_cast<uint8_t>(v);
+    return true;
+}
+
+// ============================================================================
+// 词法：一行汇编
+// ============================================================================
+struct AsmLine {
+    std::string label;      // 可空
+    std::string directive;  // ".FUNC" 等（含点）；可空
+    std::string mnemonic;   // 可空
+    std::vector<std::string> args;
+    std::string raw;
 };
 
-// ==================== 名称 -> opcode 映射 ====================
-static const std::map<std::string, uint8_t> opNameMap = {
-    {"END", OP_END},
-    {"STACK_INIT", OP_STACK_INIT},
-    {"JMP", OP_JMP},
-    {"SHORT_JMP", OP_SHORT_JMP},
-    {"SCOPE_PUSH", OP_SCOPE_PUSH},
-    {"SCOPE_POP", OP_SCOPE_POP},
-    {"STACK_PTR_MOVE", OP_STACK_PTR_MOVE},
-    {"NEW_STACK", OP_NEW_STACK},
-    {"NEW_HEAP", OP_NEW_HEAP},
-    {"DEL_HEAP", OP_DEL_HEAP},
-    {"IF_GOTO", OP_IF_GOTO},
-    {"LEA", OP_LEA},
-    {"MOVI_U32", OP_MOVI_U32},
-    {"ADD_PTR", OP_ADD_PTR},
-    {"SUB_PTR", OP_SUB_PTR},
-    {"COUT_CHAR8", OP_COUT_CHAR8},
-    {"COUT_CHAR16", OP_COUT_CHAR16},
-    {"COUT_CHAR32", OP_COUT_CHAR32},
-    {"NEW_ARRAY", OP_NEW_ARRAY},
-    {"FREE_ARRAY", OP_FREE_ARRAY},
-    {"GET_ADDRS", OP_GET_ADDRS},
-    {"JMP_IND", OP_JMP_IND},
-    {"EXTERN_CALL", OP_EXTERN_CALL},
-    {"FUNC_CALL", OP_FUNC_CALL},
-    {"JIT_SUBMIT", OP_JIT_SUBMIT},
-    {"MEMCPY", OP_MEMCPY},
-    {"GET_SYSTEM", OP_GET_SYSTEM},
-    {"DL_REG", OP_DL_REG},
-    {"DL_CALL", OP_DL_CALL},
-};
-
-// 生成所有类型化指令的名称映射
-inline void buildOpNameMapFull(std::map<std::string, uint8_t>& map) {
-    map = opNameMap;
-
-    auto add_reg = [&](const char* prefix, uint8_t base) {
-        const char* suffixes[] = {"U8","U16","U32","U64"};
-        for (int i = 0; i < 4; ++i) {
-            std::string name = std::string(prefix) + "_" + suffixes[i];
-            map[name] = static_cast<uint8_t>(base + i);
-        }
-    };
-    add_reg("REG_MOVI", OP_REG_MOVI_U8);
-    map["REG_MOV"] = OP_REG_MOV;
-    add_reg("REG_PUSH", OP_REG_PUSH_U8);
-    add_reg("REG_POP", OP_REG_POP_U8);
-    add_reg("REG_LOAD", OP_REG_LOAD_U8);
-    add_reg("REG_STORE", OP_REG_STORE_U8);
-
-    auto add_arith = [&](const char* prefix, uint8_t base, const std::vector<const char*>& types) {
-        for (size_t i = 0; i < types.size(); ++i) {
-            std::string name = std::string(prefix) + "_" + types[i];
-            map[name] = static_cast<uint8_t>(base + i);
-        }
-    };
-    add_arith("ADD", OP_ADD_U8, {"U8","U16","U32","U64","F32","F64"});
-    add_arith("SUB", OP_SUB_U8, {"U8","U16","U32","U64","F32","F64"});
-    add_arith("MUL", OP_MUL_U8, {"U8","I8","U16","I16","U32","I32","U64","I64","F32","F64"});
-    add_arith("DIV", OP_DIV_U8, {"U8","I8","U16","I16","U32","I32","U64","I64","F32","F64"});
-    add_arith("SQRT", OP_SQRT_U8, {"U8","I8","U16","I16","U32","I32","U64","I64","F32","F64"});
-    add_arith("LOG", OP_LOG_U8, {"U8","I8","U16","I16","U32","I32","U64","I64","F32","F64"});
-    add_arith("CMP_LT", OP_CMP_LT_U8, {"U8","I8","U16","I16","U32","I32","U64","I64","F32","F64","PTR"});
-    add_arith("CMP_EQ", OP_CMP_EQ_U8, {"U8","I8","U16","I16","U32","I32","U64","I64","F32","F64","PTR"});
-    add_arith("CMP_GT", OP_CMP_GT_U8, {"U8","I8","U16","I16","U32","I32","U64","I64","F32","F64","PTR"});
-    add_arith("SHL", OP_SHL_U8, {"U8","U16","U32","U64"});
-    add_arith("AND", OP_AND_U8, {"U8","U16","U32","U64"});
-    add_arith("OR", OP_OR_U8, {"U8","U16","U32","U64"});
-    add_arith("NOT", OP_NOT_U8, {"U8","U16","U32","U64"});
-    add_arith("SHR", OP_SHR_U8, {"U8","U16","U32","U64"});
-    add_arith("SHR_I", OP_SHR_I8, {"I8","I16","I32","I64"});
-    add_arith("CVT", OP_CVT_F32_U32, {"F32_U32","F32_I32","F64_U32","F64_I32",
-                                       "U32_F32","U32_F64","I32_F32","I32_F64"});
-    add_arith("ATOMIC_LOAD", OP_ATOMIC_LOAD_U32, {"U32","U64"});
-    add_arith("ATOMIC_STORE", OP_ATOMIC_STORE_U32, {"U32","U64"});
-    add_arith("ATOMIC_XCHG", OP_ATOMIC_XCHG_U32, {"U32","U64"});
-    add_arith("ATOMIC_CAS", OP_ATOMIC_CAS_U32, {"U32","U64"});
-    add_arith("ATOMIC_ADD", OP_ATOMIC_ADD_U32, {"U32","U64"});
-}
-
-// ==================== 指令长度表 (用于反汇编/偏移计算) ====================
-inline size_t instrLen(uint8_t op) {
-    switch (op) {
-    case OP_REG_MOVI_U8: return 3;
-    case OP_REG_MOVI_U16: return 4;
-    case OP_REG_MOVI_U32: return 6;
-    case OP_REG_MOVI_U64: return 10;
-    case OP_REG_MOV: return 3;
-    case OP_REG_PUSH_U8: case OP_REG_PUSH_U16: case OP_REG_PUSH_U32: case OP_REG_PUSH_U64: return 2;
-    case OP_REG_POP_U8: case OP_REG_POP_U16: case OP_REG_POP_U32: case OP_REG_POP_U64: return 2;
-    case OP_REG_LOAD_U8: case OP_REG_LOAD_U16: case OP_REG_LOAD_U32: case OP_REG_LOAD_U64: return 11;
-    case OP_REG_STORE_U8: case OP_REG_STORE_U16: case OP_REG_STORE_U32: case OP_REG_STORE_U64: return 11;
-    case OP_STACK_INIT: return 9;
-    case OP_JMP: return 5;
-    case OP_SHORT_JMP: return 2;
-    case OP_STACK_PTR_MOVE: return 5;
-    case OP_NEW_STACK: return 9;
-    case OP_NEW_HEAP: return 13;
-    case OP_DEL_HEAP: return 5;
-    case OP_IF_GOTO: return 6;
-    case OP_LEA: return 10;
-    case OP_MOVI_U32: return 5;
-    case OP_NEW_ARRAY: return 13;
-    case OP_FREE_ARRAY: return 5;
-    case OP_ATOMIC_LOAD_U32: case OP_ATOMIC_LOAD_U64:
-    case OP_ATOMIC_STORE_U32: case OP_ATOMIC_STORE_U64:
-    case OP_ATOMIC_XCHG_U32: case OP_ATOMIC_XCHG_U64:
-    case OP_ATOMIC_CAS_U32: case OP_ATOMIC_CAS_U64:
-    case OP_ATOMIC_ADD_U32: case OP_ATOMIC_ADD_U64: return 11;
-    case OP_EXTERN_CALL: return 10;
-    case OP_FUNC_CALL: return 13;
-    case OP_JIT_SUBMIT: return 9;
-    case OP_MEMCPY: return 27;
-    case OP_GET_SYSTEM: return 1;
-    case OP_DL_REG: return 9;
-    case OP_DL_CALL: return 13;
-    default: return 1;
+inline void asmSplitTokens(const std::string& s, std::vector<std::string>& out) {
+    std::string cur;
+    for (char ch : s) {
+        if (ch == ' ' || ch == '\t' || ch == ',') {
+            if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+        } else cur.push_back(ch);
     }
+    if (!cur.empty()) out.push_back(cur);
 }
 
-// ==================== 大端序/小端序读写工具 ====================
-template<class T>
-inline T rdBE(const uint8_t* p) {
-    uint64_t v = 0;
-    for (size_t i = 0; i < sizeof(T); ++i) v = (v << 8) | p[i];
-    return static_cast<T>(v);
-}
+inline std::vector<AsmLine> parseAsmLines(const std::string& text) {
+    std::vector<AsmLine> out;
+    std::istringstream is(text);
+    std::string raw;
+    while (std::getline(is, raw)) {
+        std::string line = raw;
+        const size_t sc = line.find(';');
+        if (sc != std::string::npos) line = line.substr(0, sc);
+        const size_t sl = line.find("//");
+        if (sl != std::string::npos) line = line.substr(0, sl);
+        const size_t b = line.find_first_not_of(" \t\r\n");
+        if (b == std::string::npos) continue;
+        const size_t e = line.find_last_not_of(" \t\r\n");
+        line = line.substr(b, e - b + 1);
 
-template<class T>
-inline void wrBE(uint8_t* p, T v) {
-    for (size_t i = 0; i < sizeof(T); ++i) {
-        p[sizeof(T)-1-i] = static_cast<uint8_t>(v & 0xFF);
-        v = static_cast<T>(static_cast<uint64_t>(v) >> 8);
-    }
-}
-
-template<class T>
-inline T rdLE(const uint8_t* p) {
-    uint64_t v = 0;
-    for (size_t i = 0; i < sizeof(T); ++i) v |= static_cast<uint64_t>(p[i]) << (8 * i);
-    return static_cast<T>(v);
-}
-
-template<class T>
-inline void wrLE(uint8_t* p, T v) {
-    for (size_t i = 0; i < sizeof(T); ++i) {
-        p[i] = static_cast<uint8_t>(v & 0xFF);
-        v = static_cast<T>(static_cast<uint64_t>(v) >> 8);
-    }
-}
-
-// ==================== 数值解析 ====================
-inline uint64_t parseNum(const std::string& s, bool& ok) {
-    ok = true;
-    if (s.empty()) { ok = false; return 0; }
-    if (s.size() >= 2 && s[0] == '\'' && s.back() == '\'') {
-        if (s.size() == 3) return static_cast<uint8_t>(s[1]);
-        if (s.size() == 4 && s[1] == '\\') {
-            switch (s[2]) {
-                case 'n': return '\n';
-                case 't': return '\t';
-                case '0': return '\0';
-                case '\\': return '\\';
-                case '\'': return '\'';
-                default: ok = false; return 0;
+        AsmLine L;
+        L.raw = line;
+        const size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            const std::string head = line.substr(0, colon);
+            bool looksLabel = !head.empty();
+            if (looksLabel && (isdigit(static_cast<unsigned char>(head[0])))) looksLabel = false;
+            for (char ch : head)
+                if (!(isalnum(static_cast<unsigned char>(ch)) || ch == '_' || ch == '.')) { looksLabel = false; break; }
+            if (looksLabel) {
+                L.label = head;
+                line = line.substr(colon + 1);
+                const size_t b2 = line.find_first_not_of(" \t");
+                line = (b2 == std::string::npos) ? "" : line.substr(b2);
             }
         }
-        ok = false; return 0;
+        if (!line.empty()) {
+            std::vector<std::string> toks;
+            asmSplitTokens(line, toks);
+            if (!toks.empty()) {
+                if (toks[0][0] == '.') L.directive = toks[0];
+                else L.mnemonic = toks[0];
+                L.args.assign(toks.begin() + 1, toks.end());
+            }
+        }
+        if (L.label.empty() && L.directive.empty() && L.mnemonic.empty()) continue;
+        out.push_back(L);
     }
-    try {
-        size_t pos = 0;
-        uint64_t v = std::stoull(s, &pos, 0);
-        if (pos != s.size()) { ok = false; return 0; }
-        return v;
-    } catch (...) { ok = false; return 0; }
+    return out;
 }
 
-// ==================== 寄存器解析 ====================
-inline int parseReg(const std::string& s, bool& ok) {
-    ok = false;
-    if (s.size() < 2 || (s[0] != 'R' && s[0] != 'r')) return 0;
-    try {
-        int r = std::stoi(s.substr(1));
-        if (r >= 0 && r <= 15) { ok = true; return r; }
-    } catch (...) {}
-    return 0;
-}
-
-// ==================== 指令解析 ====================
-struct Instruction {
-    uint8_t opcode;
-    std::vector<uint64_t> operands;
-    std::vector<std::string> labelRefs;
-    size_t offset = 0;
-};
-
-// ==================== 汇编器 ====================
+// ============================================================================
+// 汇编器
+// ============================================================================
 class Assembler {
 public:
     bool verbose = false;
-    bool pureBinary = false;      // -f: 无 FunctionSave 头部
-    bool littleEndianHeader = false; // -e: 头部按小端序读写（VM loadFromFile 兼容）
-    std::string inputPath;
-    std::string outputPath;
-
-    Assembler() { buildOpNameMapFull(fullOpNameMap); }
+    bool pureBinary = false;        // true：只输出纯码流（j8c 内部用）
+    bool littleEndianHeader = true; // v2 兼容开关；v3 一律小端，无实际作用
+    std::vector<ModuleFunc> funcs;  // 汇编产物：函数目录
+    std::string inputPath;          // 兼容旧 CLI 的字段（汇编器本身不用）
+    std::string outputPath;         // 兼容旧 CLI 的字段（汇编器本身不用）
+    std::string error;
 
     bool assemble(const std::string& asmText, std::vector<uint8_t>& outBytes,
                   uint32_t& argSize, uint32_t& retSize, uint32_t& entry) {
-        lines = splitLines(asmText);
-        if (!firstPass()) return false;
-        if (!resolveLabels()) return false;
-        if (!emit(outBytes, argSize, retSize, entry)) return false;
+        ModuleImage img;
+        if (!assembleModule(asmText, img)) return false;
+        argSize = entryArgSize_;
+        retSize = entryRetSize_;
+        entry = img.funcs.empty() ? 0 : img.funcs[entryFunc_].entry;
+        outBytes = pureBinary ? img.code : img.serialize();
         return true;
     }
 
-    bool disassemble(const std::vector<uint8_t>& bytes, std::ostream& os, bool hasHeader) {
-        size_t off = 0;
-        uint32_t argSize=0, retSize=0, entry=0;
-        if (hasHeader && bytes.size() >= 12) {
-            argSize = littleEndianHeader ? rdLE<uint32_t>(bytes.data())
-                                         : rdBE<uint32_t>(bytes.data());
-            retSize = littleEndianHeader ? rdLE<uint32_t>(bytes.data()+4)
-                                         : rdBE<uint32_t>(bytes.data()+4);
-            entry   = littleEndianHeader ? rdLE<uint32_t>(bytes.data()+8)
-                                         : rdBE<uint32_t>(bytes.data()+8);
-            os << "; FunctionSave header:\n";
-            os << ".ARGS " << argSize << "\n";
-            os << ".RETS " << retSize << "\n";
-            os << ".ENTRY " << entry << "\n\n";
-            off = 12;
-        }
-        while (off < bytes.size()) {
-            uint8_t op = bytes[off];
-            size_t len = instrLen(op);
-            if (len == 0) { os << "???"; break; }
-            if (off + len > bytes.size()) break;
-            std::string name;
-            for (auto& [n, o] : fullOpNameMap) {
-                if (o == op) { name = n; break; }
+    bool assembleModule(const std::string& asmText, ModuleImage& img) {
+        error.clear();
+        funcs.clear();
+        img.funcs.clear();
+        img.code.clear();
+
+        const std::vector<AsmLine> lines = parseAsmLines(asmText);
+
+        struct Pending { uint32_t at; int funcIdx; std::string name; bool isFunc; };
+        std::vector<Pending> pending;
+        std::vector<std::map<std::string, uint32_t>> labels;
+
+        struct FuncDef { std::string name; uint32_t start = 0, argSize = 0, retSize = 0; };
+        std::vector<FuncDef> defs;
+        std::map<std::string, int> funcIndex;
+        int cur = -1;
+        uint32_t argsLegacy = 0, retsLegacy = 0;
+        bool haveEntryNum = false;
+        uint32_t entryNum = 0;
+        std::string entryName;
+
+        auto emitU8 = [&](uint8_t v) { img.code.push_back(v); };
+        auto emitU16 = [&](uint16_t v) { emitU8(uint8_t(v)); emitU8(uint8_t(v >> 8)); };
+        auto emitU32 = [&](uint32_t v) { emitU16(uint16_t(v)); emitU16(uint16_t(v >> 16)); };
+        auto emitU64 = [&](uint64_t v) { emitU32(uint32_t(v)); emitU32(uint32_t(v >> 32)); };
+
+        auto startFunc = [&](const std::string& name, uint32_t as, uint32_t rs) {
+            FuncDef d;
+            d.name = name.empty() ? ("fn" + std::to_string(defs.size())) : name;
+            d.start = static_cast<uint32_t>(img.code.size());
+            d.argSize = as;
+            d.retSize = rs;
+            defs.push_back(d);
+            labels.emplace_back();
+            funcIndex[d.name] = static_cast<int>(defs.size() - 1);
+            cur = static_cast<int>(defs.size() - 1);
+        };
+
+        for (const AsmLine& L : lines) {
+            if (!L.label.empty()) {
+                if (cur < 0) startFunc("main", 0, 0);
+                labels[static_cast<size_t>(cur)][L.label] =
+                    static_cast<uint32_t>(img.code.size()) - defs[static_cast<size_t>(cur)].start;
             }
-            if (name.empty()) name = "OP_" + std::to_string(op);
-            os << name;
-            const uint8_t* p = bytes.data() + off;
+            if (!L.directive.empty()) {
+                const std::string& d = L.directive;
+                if (d == ".FUNC") {
+                    uint64_t as = 0, rs = 0;
+                    if (L.args.size() >= 2) parseU64(L.args[1], as);
+                    if (L.args.size() >= 3) parseU64(L.args[2], rs);
+                    startFunc(L.args.empty() ? "" : L.args[0], static_cast<uint32_t>(as), static_cast<uint32_t>(rs));
+                } else if (d == ".ARGS") {
+                    uint64_t t = 0;
+                    if (!L.args.empty() && parseU64(L.args[0], t)) argsLegacy = static_cast<uint32_t>(t);
+                } else if (d == ".RETS") {
+                    uint64_t t = 0;
+                    if (!L.args.empty() && parseU64(L.args[0], t)) retsLegacy = static_cast<uint32_t>(t);
+                } else if (d == ".ENTRY") {
+                    if (!L.args.empty()) {
+                        uint64_t v = 0;
+                        if (parseU64(L.args[0], v)) { haveEntryNum = true; entryNum = static_cast<uint32_t>(v); }
+                        else entryName = L.args[0];
+                    }
+                } else if (d == ".STACK" || d == ".SCOPE") {
+                    // 运行时由 STACK_INIT 决定；这里接受并忽略
+                } else if (d == ".BYTE") {
+                    for (const auto& a : L.args) {
+                        uint64_t v = 0;
+                        if (!parseU64(a, v)) { error = "非法 .BYTE 操作数: " + a; return false; }
+                        emitU8(static_cast<uint8_t>(v));
+                    }
+                } else if (d == ".FILL") {
+                    uint64_t n = 0, v = 0;
+                    if (L.args.empty() || !parseU64(L.args[0], n)) { error = "非法 .FILL"; return false; }
+                    if (L.args.size() >= 2) parseU64(L.args[1], v);
+                    for (uint64_t i = 0; i < n; ++i) emitU8(static_cast<uint8_t>(v));
+                } else {
+                    error = "未知伪指令: " + d;
+                    return false;
+                }
+                continue;
+            }
+            if (L.mnemonic.empty()) continue;
+            if (cur < 0) startFunc("main", 0, 0);
+
+            uint8_t op = 0;
+            if (!mnemonicToOp(L.mnemonic, op)) { error = "未知指令: " + L.mnemonic; return false; }
+            const int fidx = cur;
+            const uint32_t before = static_cast<uint32_t>(img.code.size());
+            emitU8(op);
+
+            auto argErr = [&](const char* what) {
+                error = std::string("指令缺少/非法操作数: ") + L.mnemonic + " 需要 " + what + "  (" + L.raw + ")";
+                return false;
+            };
+            uint8_t td = 0, r = 0, sub = 0;
+            uint64_t v = 0, a = 0, b = 0, c = 0, d2 = 0, e2 = 0;
+
             switch (op) {
-            case OP_REG_MOVI_U8:
-                os << " R" << (p[1] & 0x0F) << ", " << (int)p[2];
-                break;
-            case OP_REG_MOVI_U16:
-                os << " R" << (p[1] & 0x0F) << ", " << rdBE<uint16_t>(p+2);
-                break;
-            case OP_REG_MOVI_U32:
-                os << " R" << (p[1] & 0x0F) << ", " << rdBE<uint32_t>(p+2);
-                break;
-            case OP_REG_MOVI_U64:
-                os << " R" << (p[1] & 0x0F) << ", " << rdBE<uint64_t>(p+2);
-                break;
-            case OP_REG_MOV:
-                os << " R" << (p[1] & 0x0F) << ", R" << (p[2] & 0x0F);
-                break;
-            case OP_REG_PUSH_U8: case OP_REG_PUSH_U16: case OP_REG_PUSH_U32: case OP_REG_PUSH_U64:
-            case OP_REG_POP_U8: case OP_REG_POP_U16: case OP_REG_POP_U32: case OP_REG_POP_U64:
-                os << " R" << (p[1] & 0x0F);
-                break;
-            case OP_REG_LOAD_U8: case OP_REG_LOAD_U16: case OP_REG_LOAD_U32: case OP_REG_LOAD_U64:
-            case OP_REG_STORE_U8: case OP_REG_STORE_U16: case OP_REG_STORE_U32: case OP_REG_STORE_U64:
-                os << " R" << (p[1] & 0x0F) << ", mode" << (int)p[2] << ", " << rdBE<uint64_t>(p+3);
-                break;
-            case OP_STACK_INIT:
-                os << " " << rdBE<uint32_t>(p+1) << ", " << rdBE<uint32_t>(p+5);
-                break;
-            case OP_JMP:
-                os << " @" << rdBE<uint32_t>(p+1);
-                break;
-            case OP_SHORT_JMP:
-                os << " " << (int8_t)p[1];
-                break;
-            case OP_STACK_PTR_MOVE:
-                os << " " << rdBE<uint32_t>(p+1);
-                break;
-            case OP_NEW_STACK:
-                os << " " << rdBE<uint64_t>(p+1);
-                break;
-            case OP_NEW_HEAP:
-                os << " slotOff=" << rdBE<uint32_t>(p+1) << ", size=" << rdBE<uint64_t>(p+5);
-                break;
-            case OP_DEL_HEAP:
-                os << " slotOff=" << rdBE<uint32_t>(p+1);
-                break;
-            case OP_IF_GOTO:
-                os << " cond=" << (int)p[1] << ", @" << rdBE<uint32_t>(p+2);
-                break;
-            case OP_LEA:
-                os << " mode" << (int)p[1] << ", " << rdBE<uint64_t>(p+2);
-                break;
-            case OP_MOVI_U32:
-                os << " " << rdBE<uint32_t>(p+1);
-                break;
-            case OP_NEW_ARRAY:
-                os << " size=" << rdBE<uint64_t>(p+1) << ", slotOff=" << rdBE<uint32_t>(p+9);
-                break;
-            case OP_FREE_ARRAY:
-                os << " slotOff=" << rdBE<uint32_t>(p+1);
-                break;
-            case OP_ATOMIC_LOAD_U32: case OP_ATOMIC_LOAD_U64:
-            case OP_ATOMIC_STORE_U32: case OP_ATOMIC_STORE_U64:
-            case OP_ATOMIC_XCHG_U32: case OP_ATOMIC_XCHG_U64:
-            case OP_ATOMIC_CAS_U32: case OP_ATOMIC_CAS_U64:
-            case OP_ATOMIC_ADD_U32: case OP_ATOMIC_ADD_U64:
-                os << " R" << (p[1] & 0x0F) << ", mode" << (int)p[2] << ", " << rdBE<uint64_t>(p+3);
-                break;
-            case OP_EXTERN_CALL:
-                os << " idx=" << (int)p[1] << ", argOff=" << rdBE<uint32_t>(p+2) << ", retOff=" << rdBE<uint32_t>(p+6);
-                break;
-            case OP_DL_REG:
-                os << " fnPtrOff=" << rdBE<uint32_t>(p+1) << ", sigPtrOff=" << rdBE<uint32_t>(p+5);
-                break;
-            case OP_DL_CALL:
-                os << " idxOff=" << rdBE<uint32_t>(p+1) << ", argOff=" << rdBE<uint32_t>(p+5) << ", retOff=" << rdBE<uint32_t>(p+9);
-                break;
-            case OP_FUNC_CALL:
-                os << " fnOff=" << rdBE<uint32_t>(p+1) << ", argOff=" << rdBE<uint32_t>(p+5) << ", retOff=" << rdBE<uint32_t>(p+9);
-                break;
-            case OP_JIT_SUBMIT:
-                os << " fnOff=" << rdBE<uint32_t>(p+1) << ", retOff=" << rdBE<uint32_t>(p+5);
-                break;
-            case OP_MEMCPY:
-                os << " dstMode=" << (int)p[1] << ", dstOff=" << rdBE<uint64_t>(p+2)
-                   << ", srcMode=" << (int)p[10] << ", srcOff=" << rdBE<uint64_t>(p+11)
-                   << ", size=" << rdBE<uint64_t>(p+19);
-                break;
-            default:
-                break;
+                case OP_TRAP: case OP_NOP: case OP_HALT: case OP_RET: case OP_JMP_IND:
+                case OP_SCOPE_PUSH: case OP_SCOPE_POP: case OP_GET_ADDRS: case OP_GET_SYSTEM:
+                case OP_THREAD_EXIT: case OP_THREAD_YIELD: case OP_PROC_EXIT:
+                    break;
+
+                case OP_JMP: case OP_BRANCH: {
+                    if (L.args.size() < 1) return argErr("label");
+                    if (parseU64(L.args[0], v)) emitU32(static_cast<uint32_t>(v));
+                    else { pending.push_back({static_cast<uint32_t>(img.code.size()), fidx, L.args[0], false}); emitU32(0); }
+                    break;
+                }
+                case OP_CALL: case OP_THREAD_SPAWN: {
+                    if (L.args.size() < 3) return argErr("func, argOff, retOff");
+                    if (parseU64(L.args[0], v)) emitU16(static_cast<uint16_t>(v));
+                    else { pending.push_back({static_cast<uint32_t>(img.code.size()), fidx, L.args[0], true}); emitU16(0); }
+                    parseU64(L.args[1], a); parseU64(L.args[2], b);
+                    emitU32(static_cast<uint32_t>(a)); emitU32(static_cast<uint32_t>(b));
+                    break;
+                }
+                case OP_JIT_COMPILE: {
+                    if (L.args.size() < 3) return argErr("ptrOff, lenOff, outOff");
+                    parseU64(L.args[0], a); parseU64(L.args[1], b); parseU64(L.args[2], c);
+                    emitU32(static_cast<uint32_t>(a)); emitU32(static_cast<uint32_t>(b)); emitU32(static_cast<uint32_t>(c));
+                    break;
+                }
+                case OP_CALL_NATIVE: {
+                    if (L.args.size() < 3) return argErr("reg, argBaseOff, retOff");
+                    if (!parseReg(L.args[0], r)) { error = "非法寄存器: " + L.args[0]; return false; }
+                    parseU64(L.args[1], a); parseU64(L.args[2], b);
+                    emitU8(r); emitU32(static_cast<uint32_t>(a)); emitU32(static_cast<uint32_t>(b));
+                    break;
+                }
+                case OP_JIT_SUBMIT: {
+                    if (L.args.size() < 2) return argErr("func, outOff");
+                    if (parseU64(L.args[0], v)) emitU16(static_cast<uint16_t>(v));
+                    else { pending.push_back({static_cast<uint32_t>(img.code.size()), fidx, L.args[0], true}); emitU16(0); }
+                    parseU64(L.args[1], a); emitU32(static_cast<uint32_t>(a));
+                    break;
+                }
+                case OP_CALL_IND: {
+                    if (L.args.size() < 3) return argErr("reg, argBaseOff, retOff");
+                    if (!parseReg(L.args[0], r)) { error = "非法寄存器: " + L.args[0]; return false; }
+                    parseU64(L.args[1], a); parseU64(L.args[2], b);
+                    emitU8(r); emitU32(static_cast<uint32_t>(a)); emitU32(static_cast<uint32_t>(b));
+                    break;
+                }
+                case OP_PROC_WAIT: {
+                    if (L.args.size() < 2) return argErr("off, off");
+                    parseU64(L.args[0], a); parseU64(L.args[1], b);
+                    emitU32(static_cast<uint32_t>(a)); emitU32(static_cast<uint32_t>(b));
+                    break;
+                }
+                case OP_STACK_INIT: {
+                    if (L.args.size() < 2) return argErr("size, scopeSize");
+                    parseU64(L.args[0], a); parseU64(L.args[1], b);
+                    emitU32(static_cast<uint32_t>(a)); emitU32(static_cast<uint32_t>(b));
+                    break;
+                }
+                case OP_STACK_ALLOC:
+                    if (L.args.size() < 1) return argErr("n");
+                    parseU64(L.args[0], v); emitU64(v);
+                    break;
+                case OP_STACK_MOVE: case OP_DEL_HEAP: case OP_FREE_ARRAY:
+                case OP_THREAD_JOIN: case OP_THREAD_SELF: case OP_PROC_SELF:
+                    if (L.args.size() < 1) return argErr("off");
+                    parseU64(L.args[0], v); emitU32(static_cast<uint32_t>(v));
+                    break;
+                case OP_LEA:
+                    if (L.args.size() < 2) return argErr("mode, off");
+                    parseU64(L.args[0], a); parseU64(L.args[1], b);
+                    emitU8(static_cast<uint8_t>(a)); emitU32(static_cast<uint32_t>(b));
+                    break;
+                case OP_PROC_SPAWN: {
+                    if (L.args.size() < 2) return argErr("func, argOff");
+                    if (parseU64(L.args[0], v)) emitU16(static_cast<uint16_t>(v));
+                    else { pending.push_back({static_cast<uint32_t>(img.code.size()), fidx, L.args[0], true}); emitU16(0); }
+                    parseU64(L.args[1], a); emitU32(static_cast<uint32_t>(a));
+                    break;
+                }
+                case OP_LOAD: case OP_STORE:
+                case OP_ATOMIC_LOAD: case OP_ATOMIC_STORE: case OP_ATOMIC_XCHG:
+                case OP_ATOMIC_CAS: case OP_ATOMIC_ADD: {
+                    if (L.args.size() < 4) return argErr("td, reg, mode, off");
+                    if (!tdFromName(L.args[0], td)) { error = "非法类型: " + L.args[0]; return false; }
+                    if (!parseReg(L.args[1], r)) { error = "非法寄存器: " + L.args[1]; return false; }
+                    parseU64(L.args[2], a); parseU64(L.args[3], b);
+                    emitU8(td); emitU8(r); emitU8(static_cast<uint8_t>(a)); emitU32(static_cast<uint32_t>(b));
+                    break;
+                }
+                case OP_MOVI: {
+                    if (L.args.size() < 3) return argErr("td, reg, imm");
+                    if (!tdFromName(L.args[0], td)) { error = "非法类型: " + L.args[0]; return false; }
+                    if (!parseReg(L.args[1], r)) { error = "非法寄存器: " + L.args[1]; return false; }
+                    parseU64(L.args[2], v);
+                    emitU8(td); emitU8(r);
+                    for (uint8_t i = 0; i < tdBytes(td); ++i) emitU8(static_cast<uint8_t>(v >> (8 * i)));
+                    break;
+                }
+                case OP_PUSH_IMM: {
+                    if (L.args.size() < 2) return argErr("td, imm");
+                    if (!tdFromName(L.args[0], td)) { error = "非法类型: " + L.args[0]; return false; }
+                    parseU64(L.args[1], v);
+                    emitU8(td);
+                    for (uint8_t i = 0; i < tdBytes(td); ++i) emitU8(static_cast<uint8_t>(v >> (8 * i)));
+                    break;
+                }
+                case OP_MOV: {
+                    if (L.args.size() < 2) return argErr("dst, src");
+                    uint8_t d0 = 0, s0 = 0;
+                    if (!parseReg(L.args[0], d0) || !parseReg(L.args[1], s0)) { error = "非法寄存器"; return false; }
+                    emitU8(d0); emitU8(s0);
+                    break;
+                }
+                case OP_PUSH_REG: case OP_POP_REG: {
+                    if (L.args.size() < 2) return argErr("td, reg");
+                    if (!tdFromName(L.args[0], td)) { error = "非法类型: " + L.args[0]; return false; }
+                    if (!parseReg(L.args[1], r)) { error = "非法寄存器: " + L.args[1]; return false; }
+                    emitU8(td); emitU8(r);
+                    break;
+                }
+                case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_REM: case OP_NEG:
+                case OP_SHL: case OP_SHR: case OP_AND: case OP_OR: case OP_XOR: case OP_NOT:
+                case OP_SQRT: case OP_LOG: case OP_COUT: {
+                    if (L.args.size() < 1) return argErr("td");
+                    if (!tdFromName(L.args[0], td)) { error = "非法类型: " + L.args[0]; return false; }
+                    emitU8(td);
+                    break;
+                }
+                case OP_CMP: {
+                    if (L.args.size() < 2) return argErr("sub, td");
+                    if (!cmpFromName(L.args[0], sub)) { error = "非法比较: " + L.args[0]; return false; }
+                    if (!tdFromName(L.args[1], td)) { error = "非法类型: " + L.args[1]; return false; }
+                    emitU8(sub); emitU8(td);
+                    break;
+                }
+                case OP_CVT: {
+                    if (L.args.size() < 2) return argErr("srcTd, dstTd");
+                    uint8_t s0 = 0, d0 = 0;
+                    if (!tdFromName(L.args[0], s0) || !tdFromName(L.args[1], d0)) { error = "非法类型"; return false; }
+                    emitU8(s0); emitU8(d0);
+                    break;
+                }
+                case OP_EXTERN_CALL: {
+                    if (L.args.size() < 3) return argErr("idx, argBase, retOff");
+                    parseU64(L.args[0], a); parseU64(L.args[1], b); parseU64(L.args[2], c);
+                    emitU8(static_cast<uint8_t>(a)); emitU32(static_cast<uint32_t>(b)); emitU32(static_cast<uint32_t>(c));
+                    break;
+                }
+                case OP_DL_REG: case OP_DL_CALL: {
+                    if (L.args.size() < 3) return argErr("off, off, off");
+                    parseU64(L.args[0], a); parseU64(L.args[1], b); parseU64(L.args[2], c);
+                    emitU32(static_cast<uint32_t>(a)); emitU32(static_cast<uint32_t>(b)); emitU32(static_cast<uint32_t>(c));
+                    break;
+                }
+                case OP_NEW_HEAP:
+                    if (L.args.size() < 2) return argErr("off, size");
+                    parseU64(L.args[0], a); parseU64(L.args[1], b);
+                    emitU32(static_cast<uint32_t>(a)); emitU64(b);
+                    break;
+                case OP_NEW_ARRAY: case OP_PROC_SHARE:
+                    if (L.args.size() < 2) return argErr("size, off");
+                    parseU64(L.args[0], a); parseU64(L.args[1], b);
+                    emitU64(a); emitU32(static_cast<uint32_t>(b));
+                    break;
+                case OP_MEMCPY:
+                    if (L.args.size() < 5) return argErr("dstMode, dstOff, srcMode, srcOff, size");
+                    parseU64(L.args[0], a); parseU64(L.args[1], b); parseU64(L.args[2], c);
+                    parseU64(L.args[3], d2); parseU64(L.args[4], e2);
+                    emitU8(static_cast<uint8_t>(a)); emitU64(b);
+                    emitU8(static_cast<uint8_t>(c)); emitU64(d2); emitU64(e2);
+                    break;
+                case OP_FUNC_ADDR:
+                    if (L.args.size() < 1) return argErr("func");
+                    if (parseU64(L.args[0], v)) emitU16(static_cast<uint16_t>(v));
+                    else { pending.push_back({static_cast<uint32_t>(img.code.size()), fidx, L.args[0], true}); emitU16(0); }
+                    break;
+                default:
+                    error = std::string("未实现的指令编码: ") + L.mnemonic;
+                    return false;
             }
-            os << "\n";
-            off += len;
+            if (verbose) {
+                std::fprintf(stderr, "  [%04u] %s (%u 字节)\n", before, L.raw.c_str(),
+                             static_cast<unsigned>(img.code.size() - before));
+            }
+        }
+
+        if (defs.empty()) startFunc("main", argsLegacy, retsLegacy);
+        if (defs.size() == 1 && defs[0].name == "main") {
+            defs[0].argSize = argsLegacy;
+            defs[0].retSize = retsLegacy;
+        }
+
+        // ---- 第二趟：回填标签 / 函数名 ----
+        for (const auto& p : pending) {
+            if (p.isFunc) {
+                auto it = funcIndex.find(p.name);
+                if (it == funcIndex.end()) { error = "未知函数: " + p.name; return false; }
+                const uint16_t idx = static_cast<uint16_t>(it->second);
+                img.code[p.at] = uint8_t(idx);
+                img.code[p.at + 1] = uint8_t(idx >> 8);
+            } else {
+                if (p.funcIdx < 0) continue;
+                auto& lm = labels[static_cast<size_t>(p.funcIdx)];
+                auto it = lm.find(p.name);
+                if (it == lm.end()) { error = "未知标签: " + p.name; return false; }
+                const uint32_t off = it->second;
+                img.code[p.at] = uint8_t(off); img.code[p.at + 1] = uint8_t(off >> 8);
+                img.code[p.at + 2] = uint8_t(off >> 16); img.code[p.at + 3] = uint8_t(off >> 24);
+            }
+        }
+
+        // ---- 函数目录 ----
+        for (size_t i = 0; i < defs.size(); ++i) {
+            ModuleFunc f;
+            f.offset = defs[i].start;
+            f.size = (i + 1 < defs.size() ? defs[i + 1].start : static_cast<uint32_t>(img.code.size())) - defs[i].start;
+            f.argSize = defs[i].argSize;
+            f.retSize = defs[i].retSize;
+            f.entry = f.offset;
+            img.funcs.push_back(f);
+        }
+        funcs = img.funcs;
+
+        // ---- 入口函数 ----
+        uint32_t ef = 0;
+        if (!entryName.empty()) {
+            auto it = funcIndex.find(entryName);
+            if (it != funcIndex.end()) ef = static_cast<uint32_t>(it->second);
+            else {
+                auto l0 = labels[0].find(entryName);
+                if (l0 == labels[0].end()) { error = "未知入口: " + entryName; return false; }
+            }
+        } else if (haveEntryNum) {
+            if (entryNum < img.funcs.size()) ef = entryNum;
+            else {
+                for (size_t i = 0; i < img.funcs.size(); ++i)
+                    if (entryNum >= img.funcs[i].offset && entryNum < img.funcs[i].offset + img.funcs[i].size) { ef = static_cast<uint32_t>(i); break; }
+            }
+        }
+        if (img.funcs.empty()) { error = "空模块"; return false; }
+        if (ef >= img.funcs.size()) ef = 0;
+        entryFunc_ = ef;
+        img.entryFunc = ef;
+        entryArgSize_ = img.funcs[ef].argSize;
+        entryRetSize_ = img.funcs[ef].retSize;
+        return true;
+    }
+
+    // ---------------- 反汇编 ----------------
+    // 不变式：`-d` 的产物必须能被本汇编器原样再汇编回**逐字节相同**的模块。
+    // 但码流里可能夹着数据（j8c 把字符串常量以 .BYTE 直接写进函数体），线性扫描
+    // 会把数据当指令解码；因此凡是「解出来后无法精确还原」的行（类型字节不是已知
+    // TD、CMP 子操作数越界、跳转目标标签不存在、指令被函数尾截断），一律退化成按
+    // 字节输出的 .BYTE，保证字节流不变。入口函数下标也要显式写回，否则重新汇编
+    // 出的模块会丢掉 entryFunc。
+    bool disassemble(const std::vector<uint8_t>& bytes, std::ostream& os, bool hasHeader) {
+        ModuleImage img;
+        if (hasHeader && bytes.size() >= 20 && bytes[0] == 'J' && bytes[1] == '3') {
+            if (!img.deserialize(bytes.data(), bytes.size())) { error = "模块头解析失败"; return false; }
+        } else {
+            img.code = bytes;
+            ModuleFunc f;
+            f.size = static_cast<uint32_t>(bytes.size());
+            img.funcs.push_back(f);
+        }
+        if (!img.funcs.empty()) {
+            const uint32_t ef = img.entryFunc < img.funcs.size()
+                                    ? img.entryFunc : static_cast<uint32_t>(img.funcs.size() - 1);
+            os << ".ENTRY fn" << ef << "\n";
+        }
+        for (size_t fi = 0; fi < img.funcs.size(); ++fi) {
+            const ModuleFunc& f = img.funcs[fi];
+            os << "; .FUNC fn" << fi << " argSize=" << f.argSize << " retSize=" << f.retSize
+               << " offset=" << f.offset << " size=" << f.size << " entry=" << f.entry << "\n";
+            os << ".FUNC fn" << fi << " " << f.argSize << " " << f.retSize << "\n";
+
+            // 第一遍：贪婪线性扫描，把每行渲染到缓冲区（先不输出，跳转目标要等标签集齐）
+            struct Line { uint32_t at = 0, len = 0, target = 0; std::string text; bool exact = true, jump = false; };
+            std::vector<Line> lines;
+            uint32_t off = f.offset;
+            const uint32_t end = f.offset + f.size;
+            while (off < end) {
+                std::ostringstream tmp;
+                Line L;
+                L.at = off;
+                uint32_t next = disasmOne(img.code.data(), off, end, tmp, L.exact, L.jump, L.target);
+                if (next <= off || next > end) next = off + 1;
+                L.len = next - off;
+                L.text = tmp.str();
+                lines.push_back(std::move(L));
+                off = next;
+            }
+
+            // 第二遍：行首都会打印标签，故行首偏移即合法跳转目标集合
+            std::set<uint32_t> labels;
+            for (const auto& L : lines) labels.insert(L.at - f.offset);
+            for (auto& L : lines)
+                if (L.jump && labels.find(L.target) == labels.end()) L.exact = false;
+
+            // 第三遍：输出。不可精确还原的行按字节铺开成 .BYTE
+            for (const auto& L : lines) {
+                os << "L" << (L.at - f.offset) << ":\t";
+                if (L.exact) os << L.text;
+                else
+                    for (uint32_t k = 0; k < L.len; ++k)
+                        os << (k ? "\n\t" : "") << ".BYTE " << unsigned(img.code[L.at + k]);
+                os << "\n";
+            }
         }
         return true;
     }
 
 private:
-    std::vector<std::string> lines;
-    std::vector<Instruction> instructions;
-    std::map<std::string, size_t> labels;
-    std::set<size_t> unresolvedJumps;
-    std::map<std::string, uint8_t> fullOpNameMap;
+    uint32_t entryFunc_ = 0;
+    uint32_t entryArgSize_ = 0;
+    uint32_t entryRetSize_ = 0;
 
-    std::vector<std::string> splitLines(const std::string& text) {
-        std::vector<std::string> result;
-        std::istringstream iss(text);
-        std::string line;
-        while (std::getline(iss, line)) {
-            size_t commentPos = line.find(';');
-            if (commentPos != std::string::npos) line = line.substr(0, commentPos);
-            // 容忍逗号分隔操作数（与反汇编输出格式一致，便于回环）
-            std::replace(line.begin(), line.end(), ',', ' ');
-            size_t start = line.find_first_not_of(" \t\r\n");
-            if (start == std::string::npos) continue;
-            size_t end = line.find_last_not_of(" \t\r\n");
-            line = line.substr(start, end - start + 1);
-            if (line.empty()) continue;
-            result.push_back(line);
-        }
-        return result;
+    static uint32_t rdU32(const uint8_t* p) {
+        return uint32_t(p[0]) | (uint32_t(p[1]) << 8) | (uint32_t(p[2]) << 16) | (uint32_t(p[3]) << 24);
+    }
+    static uint64_t rdU64(const uint8_t* p) { return uint64_t(rdU32(p)) | (uint64_t(rdU32(p + 4)) << 32); }
+
+    // 类型字节能否「渲染成名字再解析回来」得到同一个字节（否则反汇编必须退化成 .BYTE）
+    static bool tdRoundTrips(uint8_t td) {
+        uint8_t back = 0;
+        return tdFromName(std::string(tdName(td)), back) && back == td;
     }
 
-    bool firstPass() {
-        instructions.clear();
-        labels.clear();
-        unresolvedJumps.clear();
-
-        for (size_t i = 0; i < lines.size(); ++i) {
-            const std::string& line = lines[i];
-            if (verbose) std::cerr << "[pass1] " << line << "\n";
-
-            if (line.back() == ':') {
-                std::string label = line.substr(0, line.size()-1);
-                if (label.empty()) { error("Empty label"); return false; }
-                if (labels.count(label)) { error("Duplicate label '" + label + "'"); return false; }
-                labels[label] = instructions.size();
-                continue;
-            }
-
-            if (line[0] == '.') {
-                std::istringstream iss(line);
-                std::string directive;
-                iss >> directive;
-                if (directive == ".STACK" || directive == ".ARGS" || directive == ".RETS"
-                    || directive == ".ENTRY" || directive == ".ENTRYOFF") {
-                    continue;
-                } else if (directive == ".BYTE") {
-                    std::vector<uint64_t> vals;
-                    std::string token;
-                    while (iss >> token) {
-                        bool ok;
-                        uint64_t v = parseNum(token, ok);
-                        if (!ok) { error("Invalid .BYTE value: " + token); return false; }
-                        vals.push_back(v);
-                    }
-                    Instruction inst;
-                    inst.opcode = 0xFF;
-                    inst.operands = vals;
-                    instructions.push_back(inst);
-                    continue;
-                } else if (directive == ".FILL") {
-                    std::string cntStr, valStr;
-                    if (!(iss >> cntStr >> valStr)) { error("Usage: .FILL count, value"); return false; }
-                    bool ok;
-                    uint64_t cnt = parseNum(cntStr, ok);
-                    if (!ok) { error("Invalid .FILL count"); return false; }
-                    uint64_t val = parseNum(valStr, ok);
-                    if (!ok) { error("Invalid .FILL value"); return false; }
-                    Instruction inst;
-                    inst.opcode = 0xFE;
-                    inst.operands = {cnt, val};
-                    instructions.push_back(inst);
-                    continue;
-                } else {
-                    error("Unknown directive: " + directive);
-                    return false;
-                }
-            }
-
-            std::istringstream iss(line);
-            std::string mnemonic;
-            iss >> mnemonic;
-            for (char& c : mnemonic) c = toupper(c);
-
-            auto it = fullOpNameMap.find(mnemonic);
-            if (it == fullOpNameMap.end()) {
-                error("Unknown instruction: " + mnemonic);
-                return false;
-            }
-            uint8_t opcode = it->second;
-
-            std::vector<std::string> tokens;
-            std::string tok;
-            while (iss >> tok) tokens.push_back(tok);
-
-            Instruction inst;
-            inst.opcode = opcode;
-
-            if (!parseOperands(inst, opcode, tokens, i)) return false;
-
-            instructions.push_back(inst);
-        }
-
-        return true;
-    }
-
-    bool parseOperands(Instruction& inst, uint8_t opcode, const std::vector<std::string>& tokens, size_t lineIdx) {
-        auto expectCount = [&](size_t n) -> bool {
-            if (tokens.size() != n) {
-                error("Expected " + std::to_string(n) + " operand(s) at line " + std::to_string(lineIdx+1));
-                return false;
-            }
-            return true;
+    // 渲染一条指令：返回下一条指令的偏移；exact=false 表示这一行无法精确还原
+    // （调用方会把它改写成 .BYTE 序列）；jump=true 时 target 是函数相对的标签偏移。
+    static uint32_t disasmOne(const uint8_t* c, uint32_t at, uint32_t end, std::ostream& os,
+                              bool& exact, bool& jump, uint32_t& target) {
+        const uint8_t op = c[at];
+        const std::string_view n = opName(op);
+        if (n.empty() || n[0] == '?') { os << ".BYTE " << unsigned(c[at]); return at + 1; }
+        os << n;
+        const uint8_t* p = c + at + 1;
+        auto guard = [&](uint32_t need) { return at + 1 + need <= end; };
+        auto guarded = [&](uint32_t need) { if (!guard(need)) { exact = false; return false; } return true; };
+        auto typed = [&](uint8_t td) { if (!tdRoundTrips(td)) exact = false; };
+        auto cmpName = [](uint8_t s) {
+            return s == CMP_LT ? "LT" : s == CMP_LE ? "LE" : s == CMP_EQ ? "EQ"
+                 : s == CMP_NE ? "NE" : s == CMP_GT ? "GT" : "GE";
         };
-
-        switch (opcode) {
-        case OP_REG_MOVI_U8: case OP_REG_MOVI_U16: case OP_REG_MOVI_U32: case OP_REG_MOVI_U64: {
-            if (!expectCount(2)) return false;
-            bool ok; int r = parseReg(tokens[0], ok);
-            if (!ok) { error("Bad register: " + tokens[0]); return false; }
-            uint64_t imm = parseNum(tokens[1], ok);
-            if (!ok) { error("Bad immediate: " + tokens[1]); return false; }
-            inst.operands = {static_cast<uint64_t>(r), imm};
-            return true;
-        }
-        case OP_REG_MOV: {
-            if (!expectCount(2)) return false;
-            bool ok; int r1 = parseReg(tokens[0], ok);
-            if (!ok) { error("Bad register: " + tokens[0]); return false; }
-            int r2 = parseReg(tokens[1], ok);
-            if (!ok) { error("Bad register: " + tokens[1]); return false; }
-            inst.operands = {static_cast<uint64_t>(r1), static_cast<uint64_t>(r2)};
-            return true;
-        }
-        case OP_REG_PUSH_U8: case OP_REG_PUSH_U16: case OP_REG_PUSH_U32: case OP_REG_PUSH_U64:
-        case OP_REG_POP_U8: case OP_REG_POP_U16: case OP_REG_POP_U32: case OP_REG_POP_U64: {
-            if (!expectCount(1)) return false;
-            bool ok; int r = parseReg(tokens[0], ok);
-            if (!ok) { error("Bad register: " + tokens[0]); return false; }
-            inst.operands = {static_cast<uint64_t>(r)};
-            return true;
-        }
-        case OP_REG_LOAD_U8: case OP_REG_LOAD_U16: case OP_REG_LOAD_U32: case OP_REG_LOAD_U64:
-        case OP_REG_STORE_U8: case OP_REG_STORE_U16: case OP_REG_STORE_U32: case OP_REG_STORE_U64: {
-            if (!expectCount(3)) return false;
-            bool ok; int r = parseReg(tokens[0], ok);
-            if (!ok) { error("Bad register: " + tokens[0]); return false; }
-            uint64_t mode = parseNum(tokens[1], ok);
-            if (!ok || mode > 1) { error("Bad mode (0 or 1): " + tokens[1]); return false; }
-            uint64_t off = parseNum(tokens[2], ok);
-            if (!ok) { error("Bad offset: " + tokens[2]); return false; }
-            inst.operands = {static_cast<uint64_t>(r), mode, off};
-            return true;
-        }
-        case OP_STACK_INIT: {
-            if (!expectCount(2)) return false;
-            bool ok;
-            uint64_t s1 = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad stack size: " + tokens[0]); return false; }
-            uint64_t s2 = parseNum(tokens[1], ok);
-            if (!ok) { error("Bad scope size: " + tokens[1]); return false; }
-            inst.operands = {s1, s2};
-            return true;
-        }
-        case OP_JMP: {
-            if (!expectCount(1)) return false;
-            if (tokens[0][0] == '@') {
-                inst.labelRefs.push_back(tokens[0].substr(1));
-                unresolvedJumps.insert(instructions.size());
-            } else {
-                bool ok;
-                uint64_t addr = parseNum(tokens[0], ok);
-                if (!ok) { error("Bad jump target: " + tokens[0]); return false; }
-                inst.operands = {addr};
+        switch (op) {
+            case OP_JMP: case OP_BRANCH:
+                if (!guarded(4)) return at + 1;
+                jump = true; target = rdU32(p);
+                os << " L" << target; return at + 5;
+            case OP_CALL:
+                if (!guarded(10)) return at + 1;
+                os << " " << (rdU32(p) & 0xFFFF) << ", " << rdU32(p + 2) << ", " << rdU32(p + 6);
+                return at + 11;
+            case OP_JIT_SUBMIT:
+                if (!guarded(6)) return at + 1;
+                os << " " << (rdU32(p) & 0xFFFF) << ", " << rdU32(p + 2); return at + 7;
+            case OP_JIT_COMPILE:
+                if (!guarded(12)) return at + 1;
+                os << " " << rdU32(p) << ", " << rdU32(p + 4) << ", " << rdU32(p + 8); return at + 13;
+            case OP_CALL_NATIVE:
+                if (!guarded(9)) return at + 1;
+                os << " R" << unsigned(p[0]) << ", " << rdU32(p + 1) << ", " << rdU32(p + 5); return at + 10;
+            case OP_CALL_IND:
+                if (!guarded(9)) return at + 1;
+                os << " R" << unsigned(p[0]) << ", " << rdU32(p + 1) << ", " << rdU32(p + 5); return at + 10;
+            case OP_PROC_WAIT:
+                if (!guarded(8)) return at + 1;
+                os << " " << rdU32(p) << ", " << rdU32(p + 4); return at + 9;
+            case OP_STACK_INIT:
+                if (!guarded(8)) return at + 1;
+                os << " " << rdU32(p) << " " << rdU32(p + 4); return at + 9;
+            case OP_STACK_ALLOC:
+                if (!guarded(8)) return at + 1;
+                os << " " << rdU64(p); return at + 9;
+            case OP_STACK_MOVE: case OP_DEL_HEAP: case OP_FREE_ARRAY:
+            case OP_THREAD_JOIN: case OP_THREAD_SELF: case OP_PROC_SELF:
+                if (!guarded(4)) return at + 1;
+                os << " " << rdU32(p); return at + 5;
+            case OP_LEA:
+                if (!guarded(5)) return at + 1;
+                os << " " << unsigned(p[0]) << ", " << rdU32(p + 1); return at + 6;
+            case OP_PROC_SPAWN:
+                if (!guarded(6)) return at + 1;
+                os << " " << (rdU32(p) & 0xFFFF) << ", " << rdU32(p + 2); return at + 7;
+            case OP_LOAD: case OP_STORE:
+            case OP_ATOMIC_LOAD: case OP_ATOMIC_STORE: case OP_ATOMIC_XCHG:
+            case OP_ATOMIC_CAS: case OP_ATOMIC_ADD:
+                if (!guarded(7)) return at + 1;
+                typed(p[0]);
+                os << " " << tdName(p[0]) << " R" << unsigned(p[1]) << ", " << unsigned(p[2]) << ", " << rdU32(p + 3);
+                return at + 8;
+            case OP_MOVI: {
+                if (!guarded(2)) return at + 1;
+                const uint8_t td = p[0], r = p[1], w = tdBytes(td);
+                if (!guarded(2u + w)) return at + 1;
+                typed(td);
+                os << " " << tdName(td) << " R" << unsigned(r) << ", " << asmLoadRaw(p + 2, w);
+                return at + 3 + w;
             }
-            return true;
-        }
-        case OP_SHORT_JMP: {
-            if (!expectCount(1)) return false;
-            bool ok;
-            int64_t rel = static_cast<int64_t>(parseNum(tokens[0], ok));
-            if (!ok) { error("Bad relative offset: " + tokens[0]); return false; }
-            inst.operands = {static_cast<uint64_t>(static_cast<uint8_t>(rel & 0xFF))};
-            return true;
-        }
-        case OP_STACK_PTR_MOVE: {
-            if (!expectCount(1)) return false;
-            bool ok;
-            uint64_t dec = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad decrement: " + tokens[0]); return false; }
-            inst.operands = {dec};
-            return true;
-        }
-        case OP_NEW_STACK: {
-            if (!expectCount(1)) return false;
-            bool ok;
-            uint64_t bytes = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad bytes: " + tokens[0]); return false; }
-            inst.operands = {bytes};
-            return true;
-        }
-        case OP_NEW_HEAP: {
-            if (!expectCount(2)) return false;
-            bool ok;
-            uint64_t slotOff = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad slotOff: " + tokens[0]); return false; }
-            uint64_t size = parseNum(tokens[1], ok);
-            if (!ok) { error("Bad size: " + tokens[1]); return false; }
-            inst.operands = {slotOff, size};
-            return true;
-        }
-        case OP_DEL_HEAP: {
-            if (!expectCount(1)) return false;
-            bool ok;
-            uint64_t slotOff = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad slotOff: " + tokens[0]); return false; }
-            inst.operands = {slotOff};
-            return true;
-        }
-        case OP_IF_GOTO: {
-            if (!expectCount(2)) return false;
-            bool ok;
-            uint64_t cond = parseNum(tokens[0], ok);
-            if (!ok || cond > 255) { error("Bad condition: " + tokens[0]); return false; }
-            if (tokens[1][0] == '@') {
-                inst.labelRefs.push_back(tokens[1].substr(1));
-                unresolvedJumps.insert(instructions.size());
-                inst.operands = {cond};
-            } else {
-                uint64_t addr = parseNum(tokens[1], ok);
-                if (!ok) { error("Bad jump target: " + tokens[1]); return false; }
-                inst.operands = {cond, addr};
+            case OP_PUSH_IMM: {
+                if (!guarded(1)) return at + 1;
+                const uint8_t td = p[0], w = tdBytes(td);
+                if (!guarded(1u + w)) return at + 1;
+                typed(td);
+                os << " " << tdName(td) << " " << asmLoadRaw(p + 1, w);
+                return at + 2 + w;
             }
-            return true;
+            case OP_MOV:
+                if (!guarded(2)) return at + 1;
+                os << " R" << unsigned(p[0]) << ", R" << unsigned(p[1]); return at + 3;
+            case OP_PUSH_REG: case OP_POP_REG:
+                if (!guarded(2)) return at + 1;
+                typed(p[0]);
+                os << " " << tdName(p[0]) << " R" << unsigned(p[1]); return at + 3;
+            case OP_CMP:
+                if (!guarded(2)) return at + 1;
+                if (p[0] > CMP_GE) exact = false;   // cmpName 会把越界值一律写成 GE
+                typed(p[1]);
+                os << " " << cmpName(p[0]) << " " << tdName(p[1]); return at + 3;
+            case OP_CVT:
+                if (!guarded(2)) return at + 1;
+                typed(p[0]); typed(p[1]);
+                os << " " << tdName(p[0]) << ", " << tdName(p[1]); return at + 3;
+            case OP_EXTERN_CALL:
+                if (!guarded(9)) return at + 1;
+                os << " " << unsigned(p[0]) << ", " << rdU32(p + 1) << ", " << rdU32(p + 5); return at + 10;
+            case OP_DL_REG: case OP_DL_CALL:
+                if (!guarded(12)) return at + 1;
+                os << " " << rdU32(p) << ", " << rdU32(p + 4) << ", " << rdU32(p + 8); return at + 13;
+            case OP_NEW_HEAP:
+                if (!guarded(12)) return at + 1;
+                os << " " << rdU32(p) << ", " << rdU64(p + 4); return at + 13;
+            case OP_NEW_ARRAY: case OP_PROC_SHARE:
+                if (!guarded(12)) return at + 1;
+                os << " " << rdU64(p) << ", " << rdU32(p + 8); return at + 13;
+            case OP_MEMCPY:
+                if (!guarded(26)) return at + 1;
+                os << " " << unsigned(p[0]) << ", " << rdU64(p + 1) << ", " << unsigned(p[9])
+                   << ", " << rdU64(p + 10) << ", " << rdU64(p + 18);
+                return at + 27;
+            case OP_FUNC_ADDR:
+                if (!guarded(2)) return at + 1;
+                os << " " << (rdU32(p) & 0xFFFF); return at + 3;
+            case OP_ADD: case OP_SUB: case OP_MUL: case OP_DIV: case OP_REM: case OP_NEG:
+            case OP_SHL: case OP_SHR: case OP_AND: case OP_OR: case OP_XOR: case OP_NOT:
+            case OP_SQRT: case OP_LOG: case OP_COUT:
+                if (!guarded(1)) return at + 1;
+                typed(p[0]);
+                os << " " << tdName(p[0]); return at + 2;
+            default:
+                return at + 1;
         }
-        case OP_LEA: {
-            if (!expectCount(2)) return false;
-            bool ok;
-            uint64_t mode = parseNum(tokens[0], ok);
-            if (!ok || mode > 1) { error("Bad mode: " + tokens[0]); return false; }
-            uint64_t off = parseNum(tokens[1], ok);
-            if (!ok) { error("Bad offset: " + tokens[1]); return false; }
-            inst.operands = {mode, off};
-            return true;
-        }
-        case OP_MOVI_U32: {
-            if (!expectCount(1)) return false;
-            bool ok;
-            uint64_t imm = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad immediate: " + tokens[0]); return false; }
-            inst.operands = {imm};
-            return true;
-        }
-        case OP_NEW_ARRAY: {
-            if (!expectCount(2)) return false;
-            bool ok;
-            uint64_t size = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad size: " + tokens[0]); return false; }
-            uint64_t slotOff = parseNum(tokens[1], ok);
-            if (!ok) { error("Bad slotOff: " + tokens[1]); return false; }
-            inst.operands = {size, slotOff};
-            return true;
-        }
-        case OP_FREE_ARRAY: {
-            if (!expectCount(1)) return false;
-            bool ok;
-            uint64_t slotOff = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad slotOff: " + tokens[0]); return false; }
-            inst.operands = {slotOff};
-            return true;
-        }
-        case OP_ATOMIC_LOAD_U32: case OP_ATOMIC_LOAD_U64:
-        case OP_ATOMIC_STORE_U32: case OP_ATOMIC_STORE_U64:
-        case OP_ATOMIC_XCHG_U32: case OP_ATOMIC_XCHG_U64:
-        case OP_ATOMIC_CAS_U32: case OP_ATOMIC_CAS_U64:
-        case OP_ATOMIC_ADD_U32: case OP_ATOMIC_ADD_U64: {
-            if (!expectCount(3)) return false;
-            bool ok; int r = parseReg(tokens[0], ok);
-            if (!ok) { error("Bad register: " + tokens[0]); return false; }
-            uint64_t mode = parseNum(tokens[1], ok);
-            if (!ok || mode > 1) { error("Bad mode: " + tokens[1]); return false; }
-            uint64_t off = parseNum(tokens[2], ok);
-            if (!ok) { error("Bad offset: " + tokens[2]); return false; }
-            inst.operands = {static_cast<uint64_t>(r), mode, off};
-            return true;
-        }
-        case OP_EXTERN_CALL: {
-            if (!expectCount(3)) return false;
-            bool ok;
-            uint64_t idx = parseNum(tokens[0], ok);
-            if (!ok || idx > 255) { error("Bad idx: " + tokens[0]); return false; }
-            uint64_t argOff = parseNum(tokens[1], ok);
-            if (!ok) { error("Bad argOff: " + tokens[1]); return false; }
-            uint64_t retOff = parseNum(tokens[2], ok);
-            if (!ok) { error("Bad retOff: " + tokens[2]); return false; }
-            inst.operands = {idx, argOff, retOff};
-            return true;
-        }
-        case OP_DL_REG: {
-            if (!expectCount(2)) return false;
-            bool ok;
-            uint64_t fnPtrOff = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad fnPtrOff: " + tokens[0]); return false; }
-            uint64_t sigPtrOff = parseNum(tokens[1], ok);
-            if (!ok) { error("Bad sigPtrOff: " + tokens[1]); return false; }
-            inst.operands = {fnPtrOff, sigPtrOff};
-            return true;
-        }
-        case OP_DL_CALL: {
-            if (!expectCount(3)) return false;
-            bool ok;
-            uint64_t idxOff = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad idxOff: " + tokens[0]); return false; }
-            uint64_t argOff = parseNum(tokens[1], ok);
-            if (!ok) { error("Bad argOff: " + tokens[1]); return false; }
-            uint64_t retOff = parseNum(tokens[2], ok);
-            if (!ok) { error("Bad retOff: " + tokens[2]); return false; }
-            inst.operands = {idxOff, argOff, retOff};
-            return true;
-        }
-        case OP_JIT_SUBMIT: {
-            if (!expectCount(2)) return false;
-            bool ok;
-            uint64_t fnOff = parseNum(tokens[0], ok);
-            if (!ok) { error("Bad fnOff: " + tokens[0]); return false; }
-            uint64_t retOff = parseNum(tokens[1], ok);
-            if (!ok) { error("Bad retOff: " + tokens[1]); return false; }
-            inst.operands = {fnOff, retOff};
-            return true;
-        }
-        case OP_MEMCPY: {
-            if (!expectCount(5)) return false;
-            bool ok;
-            uint64_t dstMode = parseNum(tokens[0], ok);
-            if (!ok || dstMode > 1) { error("Bad dstMode: " + tokens[0]); return false; }
-            uint64_t dstOff = parseNum(tokens[1], ok);
-            if (!ok) { error("Bad dstOff: " + tokens[1]); return false; }
-            uint64_t srcMode = parseNum(tokens[2], ok);
-            if (!ok || srcMode > 1) { error("Bad srcMode: " + tokens[2]); return false; }
-            uint64_t srcOff = parseNum(tokens[3], ok);
-            if (!ok) { error("Bad srcOff: " + tokens[3]); return false; }
-            uint64_t size = parseNum(tokens[4], ok);
-            if (!ok) { error("Bad size: " + tokens[4]); return false; }
-            inst.operands = {dstMode, dstOff, srcMode, srcOff, size};
-            return true;
-        }
-        default: {
-            if (!tokens.empty()) {
-                error("Instruction " + std::to_string(opcode) + " does not take operands");
-                return false;
-            }
-            return true;
-        }
-        }
-        return true;
-    }
-
-    bool resolveLabels() {
-        size_t offset = 0;
-        for (size_t i = 0; i < instructions.size(); ++i) {
-            instructions[i].offset = offset;
-            if (instructions[i].opcode == 0xFF) {
-                offset += instructions[i].operands.size();
-            } else if (instructions[i].opcode == 0xFE) {
-                offset += instructions[i].operands[0];
-            } else {
-                offset += instrLen(instructions[i].opcode);
-            }
-        }
-
-        for (size_t i : unresolvedJumps) {
-            Instruction& inst = instructions[i];
-            if (inst.labelRefs.empty()) continue;
-            const std::string& label = inst.labelRefs[0];
-            auto it = labels.find(label);
-            if (it == labels.end()) {
-                error("Undefined label: " + label);
-                return false;
-            }
-            size_t targetIdx = it->second;
-            if (targetIdx >= instructions.size()) {
-                error("Label points to invalid instruction index");
-                return false;
-            }
-            size_t targetOffset = instructions[targetIdx].offset;
-            if (inst.opcode == OP_JMP) {
-                inst.operands = {static_cast<uint64_t>(targetOffset)};
-            } else if (inst.opcode == OP_IF_GOTO) {
-                if (inst.operands.size() == 1) {
-                    inst.operands.push_back(static_cast<uint64_t>(targetOffset));
-                } else {
-                    inst.operands[1] = targetOffset;
-                }
-            } else {
-                error("Unsupported label reference for opcode " + std::to_string(inst.opcode));
-                return false;
-            }
-        }
-        return true;
-    }
-
-    bool emit(std::vector<uint8_t>& outBytes, uint32_t& argSize, uint32_t& retSize, uint32_t& entry) {
-        argSize = 0;
-        retSize = 0;
-        entry = 0;
-        bool hasEntry = false;
-        for (const auto& line : lines) {
-            if (line[0] == '.') {
-                std::istringstream iss(line);
-                std::string dir;
-                iss >> dir;
-                if (dir == ".ARGS") {
-                    std::string val; iss >> val;
-                    bool ok; argSize = static_cast<uint32_t>(parseNum(val, ok));
-                    if (!ok) { error("Bad .ARGS value"); return false; }
-                } else if (dir == ".RETS") {
-                    std::string val; iss >> val;
-                    bool ok; retSize = static_cast<uint32_t>(parseNum(val, ok));
-                    if (!ok) { error("Bad .RETS value"); return false; }
-                } else if (dir == ".ENTRY") {
-                    std::string val; iss >> val;
-                    bool ok; entry = static_cast<uint32_t>(parseNum(val, ok));
-                    if (!ok) { error("Bad .ENTRY value"); return false; }
-                    hasEntry = true;
-                } else if (dir == ".ENTRYOFF") {
-                    std::string label; iss >> label;
-                    auto it = labels.find(label);
-                    if (it == labels.end()) { error("Undefined label for .ENTRYOFF"); return false; }
-                    size_t idx = it->second;
-                    if (idx >= instructions.size()) { error("Label index out of range"); return false; }
-                    entry = static_cast<uint32_t>(instructions[idx].offset);
-                    hasEntry = true;
-                }
-            }
-        }
-        if (!hasEntry) {
-            entry = 0;
-        }
-
-        if (!pureBinary) {
-            uint8_t header[12];
-            if (littleEndianHeader) {
-                wrLE<uint32_t>(header, argSize);
-                wrLE<uint32_t>(header+4, retSize);
-                wrLE<uint32_t>(header+8, entry);
-            } else {
-                wrBE<uint32_t>(header, argSize);
-                wrBE<uint32_t>(header+4, retSize);
-                wrBE<uint32_t>(header+8, entry);
-            }
-            outBytes.insert(outBytes.end(), header, header+12);
-        }
-
-        for (const auto& inst : instructions) {
-            if (inst.opcode == 0xFF) {
-                for (uint64_t v : inst.operands) {
-                    outBytes.push_back(static_cast<uint8_t>(v & 0xFF));
-                }
-            } else if (inst.opcode == 0xFE) {
-                uint64_t count = inst.operands[0];
-                uint64_t val = inst.operands[1];
-                for (uint64_t j = 0; j < count; ++j) {
-                    outBytes.push_back(static_cast<uint8_t>(val & 0xFF));
-                }
-            } else {
-                uint8_t op = inst.opcode;
-                outBytes.push_back(op);
-                switch (op) {
-                case OP_REG_MOVI_U8: {
-                    uint8_t reg = static_cast<uint8_t>(inst.operands[0] & 0x0F);
-                    uint8_t imm = static_cast<uint8_t>(inst.operands[1] & 0xFF);
-                    outBytes.push_back(reg);
-                    outBytes.push_back(imm);
-                    break;
-                }
-                case OP_REG_MOVI_U16: {
-                    uint8_t reg = static_cast<uint8_t>(inst.operands[0] & 0x0F);
-                    uint16_t imm = static_cast<uint16_t>(inst.operands[1]);
-                    outBytes.push_back(reg);
-                    outBytes.resize(outBytes.size()+2);
-                    wrBE<uint16_t>(&outBytes[outBytes.size()-2], imm);
-                    break;
-                }
-                case OP_REG_MOVI_U32: {
-                    uint8_t reg = static_cast<uint8_t>(inst.operands[0] & 0x0F);
-                    uint32_t imm = static_cast<uint32_t>(inst.operands[1]);
-                    outBytes.push_back(reg);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], imm);
-                    break;
-                }
-                case OP_REG_MOVI_U64: {
-                    uint8_t reg = static_cast<uint8_t>(inst.operands[0] & 0x0F);
-                    uint64_t imm = inst.operands[1];
-                    outBytes.push_back(reg);
-                    outBytes.resize(outBytes.size()+8);
-                    wrBE<uint64_t>(&outBytes[outBytes.size()-8], imm);
-                    break;
-                }
-                case OP_REG_MOV: {
-                    uint8_t dst = static_cast<uint8_t>(inst.operands[0] & 0x0F);
-                    uint8_t src = static_cast<uint8_t>(inst.operands[1] & 0x0F);
-                    outBytes.push_back(dst);
-                    outBytes.push_back(src);
-                    break;
-                }
-                case OP_REG_PUSH_U8: case OP_REG_PUSH_U16: case OP_REG_PUSH_U32: case OP_REG_PUSH_U64:
-                case OP_REG_POP_U8: case OP_REG_POP_U16: case OP_REG_POP_U32: case OP_REG_POP_U64: {
-                    uint8_t reg = static_cast<uint8_t>(inst.operands[0] & 0x0F);
-                    outBytes.push_back(reg);
-                    break;
-                }
-                case OP_REG_LOAD_U8: case OP_REG_LOAD_U16: case OP_REG_LOAD_U32: case OP_REG_LOAD_U64:
-                case OP_REG_STORE_U8: case OP_REG_STORE_U16: case OP_REG_STORE_U32: case OP_REG_STORE_U64: {
-                    uint8_t reg = static_cast<uint8_t>(inst.operands[0] & 0x0F);
-                    uint8_t mode = static_cast<uint8_t>(inst.operands[1] & 0xFF);
-                    uint64_t off = inst.operands[2];
-                    outBytes.push_back(reg);
-                    outBytes.push_back(mode);
-                    outBytes.resize(outBytes.size()+8);
-                    wrBE<uint64_t>(&outBytes[outBytes.size()-8], off);
-                    break;
-                }
-                case OP_STACK_INIT: {
-                    uint32_t stackSize = static_cast<uint32_t>(inst.operands[0]);
-                    uint32_t scopeSize = static_cast<uint32_t>(inst.operands[1]);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], stackSize);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], scopeSize);
-                    break;
-                }
-                case OP_JMP: {
-                    uint32_t addr = static_cast<uint32_t>(inst.operands[0]);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], addr);
-                    break;
-                }
-                case OP_SHORT_JMP: {
-                    uint8_t rel = static_cast<uint8_t>(inst.operands[0] & 0xFF);
-                    outBytes.push_back(rel);
-                    break;
-                }
-                case OP_STACK_PTR_MOVE: {
-                    uint32_t dec = static_cast<uint32_t>(inst.operands[0]);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], dec);
-                    break;
-                }
-                case OP_NEW_STACK: {
-                    uint64_t bytes = inst.operands[0];
-                    outBytes.resize(outBytes.size()+8);
-                    wrBE<uint64_t>(&outBytes[outBytes.size()-8], bytes);
-                    break;
-                }
-                case OP_NEW_HEAP: {
-                    uint32_t slotOff = static_cast<uint32_t>(inst.operands[0]);
-                    uint64_t size = inst.operands[1];
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], slotOff);
-                    outBytes.resize(outBytes.size()+8);
-                    wrBE<uint64_t>(&outBytes[outBytes.size()-8], size);
-                    break;
-                }
-                case OP_DEL_HEAP: {
-                    uint32_t slotOff = static_cast<uint32_t>(inst.operands[0]);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], slotOff);
-                    break;
-                }
-                case OP_IF_GOTO: {
-                    uint8_t cond = static_cast<uint8_t>(inst.operands[0] & 0xFF);
-                    uint32_t addr = static_cast<uint32_t>(inst.operands[1]);
-                    outBytes.push_back(cond);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], addr);
-                    break;
-                }
-                case OP_LEA: {
-                    uint8_t mode = static_cast<uint8_t>(inst.operands[0] & 0xFF);
-                    uint64_t off = inst.operands[1];
-                    outBytes.push_back(mode);
-                    outBytes.resize(outBytes.size()+8);
-                    wrBE<uint64_t>(&outBytes[outBytes.size()-8], off);
-                    break;
-                }
-                case OP_MOVI_U32: {
-                    uint32_t imm = static_cast<uint32_t>(inst.operands[0]);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], imm);
-                    break;
-                }
-                case OP_NEW_ARRAY: {
-                    uint64_t size = inst.operands[0];
-                    uint32_t slotOff = static_cast<uint32_t>(inst.operands[1]);
-                    outBytes.resize(outBytes.size()+8);
-                    wrBE<uint64_t>(&outBytes[outBytes.size()-8], size);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], slotOff);
-                    break;
-                }
-                case OP_FREE_ARRAY: {
-                    uint32_t slotOff = static_cast<uint32_t>(inst.operands[0]);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], slotOff);
-                    break;
-                }
-                case OP_ATOMIC_LOAD_U32: case OP_ATOMIC_LOAD_U64:
-                case OP_ATOMIC_STORE_U32: case OP_ATOMIC_STORE_U64:
-                case OP_ATOMIC_XCHG_U32: case OP_ATOMIC_XCHG_U64:
-                case OP_ATOMIC_CAS_U32: case OP_ATOMIC_CAS_U64:
-                case OP_ATOMIC_ADD_U32: case OP_ATOMIC_ADD_U64: {
-                    uint8_t reg = static_cast<uint8_t>(inst.operands[0] & 0x0F);
-                    uint8_t mode = static_cast<uint8_t>(inst.operands[1] & 0xFF);
-                    uint64_t off = inst.operands[2];
-                    outBytes.push_back(reg);
-                    outBytes.push_back(mode);
-                    outBytes.resize(outBytes.size()+8);
-                    wrBE<uint64_t>(&outBytes[outBytes.size()-8], off);
-                    break;
-                }
-                case OP_EXTERN_CALL: {
-                    uint8_t idx = static_cast<uint8_t>(inst.operands[0] & 0xFF);
-                    uint32_t argOff = static_cast<uint32_t>(inst.operands[1]);
-                    uint32_t retOff = static_cast<uint32_t>(inst.operands[2]);
-                    outBytes.push_back(idx);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], argOff);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], retOff);
-                    break;
-                }
-                case OP_DL_REG: {
-                    for (int k = 0; k < 2; ++k) {
-                        outBytes.resize(outBytes.size()+4);
-                        wrBE<uint32_t>(&outBytes[outBytes.size()-4], static_cast<uint32_t>(inst.operands[k]));
-                    }
-                    break;
-                }
-                case OP_DL_CALL: {
-                    for (int k = 0; k < 3; ++k) {
-                        outBytes.resize(outBytes.size()+4);
-                        wrBE<uint32_t>(&outBytes[outBytes.size()-4], static_cast<uint32_t>(inst.operands[k]));
-                    }
-                    break;
-                }
-                case OP_FUNC_CALL: {
-                    uint32_t fnOff = static_cast<uint32_t>(inst.operands[0]);
-                    uint32_t argOff = static_cast<uint32_t>(inst.operands[1]);
-                    uint32_t retOff = static_cast<uint32_t>(inst.operands[2]);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], fnOff);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], argOff);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], retOff);
-                    break;
-                }
-                case OP_JIT_SUBMIT: {
-                    uint32_t fnOff = static_cast<uint32_t>(inst.operands[0]);
-                    uint32_t retOff = static_cast<uint32_t>(inst.operands[1]);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], fnOff);
-                    outBytes.resize(outBytes.size()+4);
-                    wrBE<uint32_t>(&outBytes[outBytes.size()-4], retOff);
-                    break;
-                }
-                case OP_MEMCPY: {
-                    uint8_t dstMode = static_cast<uint8_t>(inst.operands[0] & 0xFF);
-                    uint64_t dstOff = inst.operands[1];
-                    uint8_t srcMode = static_cast<uint8_t>(inst.operands[2] & 0xFF);
-                    uint64_t srcOff = inst.operands[3];
-                    uint64_t size = inst.operands[4];
-                    outBytes.push_back(dstMode);
-                    outBytes.resize(outBytes.size()+8);
-                    wrBE<uint64_t>(&outBytes[outBytes.size()-8], dstOff);
-                    outBytes.push_back(srcMode);
-                    outBytes.resize(outBytes.size()+8);
-                    wrBE<uint64_t>(&outBytes[outBytes.size()-8], srcOff);
-                    outBytes.resize(outBytes.size()+8);
-                    wrBE<uint64_t>(&outBytes[outBytes.size()-8], size);
-                    break;
-                }
-                default:
-                    break;
-                }
-            }
-        }
-        return true;
-    }
-
-    void error(const std::string& msg) {
-        std::cerr << "Error: " << msg << "\n";
     }
 };
 

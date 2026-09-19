@@ -1,14 +1,14 @@
-// jasm.cpp — Jadeight VM 汇编器（薄命令行入口，核心逻辑在 jadeight_asm.hpp）
+// jasm — Jadeight 汇编器 / 反汇编器（ISA v3；薄命令行入口，核心逻辑在 jadeight_asm.hpp）
 // 用法: ./jasm input.asm [-o output.bc] [-d] [-v] [-f] [-e]
-//   -d  反汇编模式: 输入 .bc 文件，输出可读指令清单
-//   -o  输出文件名 (默认 input.bc)
+//   -d  反汇编模式: 输入 .bc（v3 "J3BC" 模块），输出可读指令清单；
+//       产物保证能被本汇编器原样再汇编回**逐字节相同**的模块（见 tests/roundtrip.sh）
+//   -o  输出文件名 (默认把 input.asm 的扩展名换成 .bc)
 //   -v  详细输出 (打印汇编行/反汇编结果)
-//   -f  输出纯字节码 (无 FunctionSave 头部 [argSize,retSize,entry])
-//   -e  头部按【小端序】读写（与 Jadeight2 VM FunctionSave::loadFromFile 兼容；
-//       默认大端序，与自身反汇编回环一致）
+//   -f  只输出码流，不写 v3 模块头（"J3BC" + 函数目录）
+//   -e  为旧 CLI 保留的开关：v3 头部一律小端，本选项不改变任何字节
 //
-// 汇编器支持全部 177 条 opcode，标签，多种数值格式，
-// 伪指令 .STACK .ARGS .RETS .ENTRY .ENTRYOFF .BYTE .FILL
+// 汇编器支持 ISA v3 全部 68 条 opcode（助记名表就是 isa.hpp 的 opName，本层不再自带一份）、
+// 标签、多种数值格式，伪指令 .STACK .ARGS .RETS .ENTRY .ENTRYOFF .BYTE .FILL
 //
 // 编译: g++ -std=c++20 -O2 jasm.cpp -o jasm
 
@@ -88,7 +88,7 @@ int main(int argc, char* argv[]) {
     std::vector<uint8_t> outBytes;
     uint32_t argSize, retSize, entry;
     if (!asmblr.assemble(asmText, outBytes, argSize, retSize, entry)) {
-        std::cerr << "Assembly failed.\n";
+        std::cerr << "Assembly failed: " << asmblr.error << "\n";
         return 1;
     }
 
